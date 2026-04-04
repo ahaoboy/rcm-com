@@ -5,10 +5,7 @@ use windows::core::PCWSTR;
 
 use crate::error::{RcmError, Result};
 
-// python -c "import uuid; print(str(uuid.uuid5(uuid.NAMESPACE_URL, 'https://github.com/ahaoboy/rcm-com.git')).upper())"
-// UUID v5 of "https://github.com/ahaoboy/rcm-com.git"
-const CLSID_STR: &str = "{F96C1A16-22B8-5B5F-AEF4-B5E45A312B00}";
-const HANDLER_NAME: &str = "RcmContextMenu";
+use crate::consts::*;
 
 fn dll_path() -> Result<PathBuf> {
     let exe = std::env::current_exe().map_err(|e| RcmError::Environment(format!("Failed to get exe path: {e}")))?;

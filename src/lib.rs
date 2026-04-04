@@ -5,6 +5,7 @@ use std::ffi::c_void;
 use std::io::Write;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 pub mod cmd;
+pub mod consts;
 pub mod error;
 pub mod server;
 use windows::Win32::Foundation::*;
@@ -18,13 +19,7 @@ use windows::core::{GUID, HRESULT};
 // Constants
 // =============================================================================
 
-// UUID v5 of "https://github.com/ahaoboy/rcm-com.git"
-const CLSID_RCM: GUID = GUID::from_u128(0xF96C1A16_22B8_5B5F_AEF4_B5E45A312B00);
-
-const IID_IUNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_C000_000000000046);
-const IID_ICLASSFACTORY: GUID = GUID::from_u128(0x00000001_0000_0000_C000_000000000046);
-const IID_ISHELLEXTINIT: GUID = GUID::from_u128(0x000214E8_0000_0000_C000_000000000046);
-const IID_ICONTEXTMENU: GUID = GUID::from_u128(0x000214E4_0000_0000_C000_000000000046);
+use crate::consts::*;
 
 static DLL_MODULE: AtomicUsize = AtomicUsize::new(0);
 static DLL_REF_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -105,6 +100,65 @@ fn timestamp() -> String {
 // ContextMenuInfo - all captured right-click context data
 // =============================================================================
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum Event {
+    LeftClickSelect { flags: u32 },
+    RightClickMenu { flags: u32 },
+    ShiftSelect { flags: u32 },
+}
+
+impl Default for Event {
+    fn default() -> Self {
+        Event::RightClickMenu {
+            flags: 0,
+        }
+    }
+}
+
+impl Event {
+    pub fn flags(&self) -> u32 {
+        match self {
+            Event::LeftClickSelect { flags } => *flags,
+            Event::RightClickMenu { flags } => *flags,
+            Event::ShiftSelect { flags } => *flags,
+        }
+    }
+
+    pub fn flags_str(&self) -> String {
+        let uflags = self.flags();
+        let mut flags_str = Vec::new();
+        if uflags == 0 { flags_str.push("CMF_NORMAL"); }
+        if uflags & 0x00000001 != 0 { flags_str.push("CMF_DEFAULTONLY"); }
+        if uflags & 0x00000002 != 0 { flags_str.push("CMF_VERBSONLY"); }
+        if uflags & 0x00000004 != 0 { flags_str.push("CMF_EXPLORE"); }
+        if uflags & 0x00000008 != 0 { flags_str.push("CMF_NOVERBS"); }
+        if uflags & 0x00000010 != 0 { flags_str.push("CMF_CANRENAME"); }
+        if uflags & 0x00000020 != 0 { flags_str.push("CMF_NODEFAULT"); }
+        if uflags & 0x00000040 != 0 { flags_str.push("CMF_INCLUDESTATIC"); }
+        if uflags & 0x00000080 != 0 { flags_str.push("CMF_ITEMMENU"); }
+        if uflags & 0x00000100 != 0 { flags_str.push("CMF_EXTENDEDVERBS"); }
+        if uflags & 0x00000200 != 0 { flags_str.push("CMF_DISABLEDVERBS"); }
+        if uflags & 0x00000400 != 0 { flags_str.push("CMF_ASYNCVERBSTATE"); }
+        if uflags & 0x00000800 != 0 { flags_str.push("CMF_OPTIMIZEFORINVOKE"); }
+        if uflags & 0x00001000 != 0 { flags_str.push("CMF_SYNCCASCADEMENU"); }
+        if uflags & 0x00002000 != 0 { flags_str.push("CMF_DONOTPICKDEFAULT"); }
+        if uflags & 0x00010000 != 0 { flags_str.push("CMF_DVFILE"); }
+        flags_str.join(" | ")
+    }
+}
+
+impl std::fmt::Display for Event {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Event::LeftClickSelect { .. } => "LeftClickSelect",
+            Event::RightClickMenu { .. } => "RightClickMenu",
+            Event::ShiftSelect { .. } => "ShiftSelect",
+        };
+        write!(f, "{} ({} - {})", name, self.flags(), self.flags_str())
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ContextMenuInfo {
     pub cid: String,
@@ -118,6 +172,7 @@ pub struct ContextMenuInfo {
     pub window_handle: usize,
     pub window_class: String,
     pub process_id: u32,
+    pub event: Event,
 }
 
 impl std::fmt::Display for ContextMenuInfo {
@@ -130,6 +185,7 @@ impl std::fmt::Display for ContextMenuInfo {
         writeln!(f, "Window: 0x{:X}", self.window_handle)?;
         writeln!(f, "Window Class: {}", self.window_class)?;
         writeln!(f, "Process ID: {}", self.process_id)?;
+        writeln!(f, "Event: {}", self.event)?;
         if !self.selected_files.is_empty() {
             writeln!(f, "Selected Files:")?;
             for file in &self.selected_files {
@@ -549,11 +605,19 @@ unsafe extern "system" fn handler_query_context_menu(
     _index_menu: u32,
     _id_cmd_first: u32,
     _id_cmd_last: u32,
-    _uflags: u32,
+    uflags: u32,
 ) -> HRESULT {
     unsafe {
         let handler = &*handler_from_menu_ptr(this);
-        if let Ok(info) = handler.info.lock() {
+        if let Ok(mut info) = handler.info.lock() {
+            if uflags & 0x00000001 != 0 {
+                info.event = Event::LeftClickSelect { flags: uflags };
+            } else if uflags & 0x00000100 != 0 {
+                info.event = Event::ShiftSelect { flags: uflags };
+            } else {
+                info.event = Event::RightClickMenu { flags: uflags };
+            }
+
             let execute_result = (|| -> crate::error::Result<()> {
                 let json_str = serde_json::to_string(&*info)?;
 
