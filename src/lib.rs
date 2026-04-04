@@ -5,6 +5,8 @@ use std::ffi::c_void;
 use std::io::Write;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 pub mod cmd;
+pub mod error;
+pub mod server;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::System::SystemServices::*;
@@ -552,17 +554,14 @@ unsafe extern "system" fn handler_query_context_menu(
     unsafe {
         let handler = &*handler_from_menu_ptr(this);
         if let Ok(info) = handler.info.lock() {
-            let execute_result = (|| -> Result<(), String> {
-                let json_str = serde_json::to_string(&*info)
-                    .map_err(|e| format!("Failed to serialize context info: {}", e))?;
+            let execute_result = (|| -> crate::error::Result<()> {
+                let json_str = serde_json::to_string(&*info)?;
 
                 let mut pipe = std::fs::OpenOptions::new()
                     .write(true)
-                    .open(PIPE_NAME)
-                    .map_err(|e| format!("Failed to connect to named pipe: {}", e))?;
+                    .open(PIPE_NAME)?;
                 
-                std::io::Write::write_all(&mut pipe, json_str.as_bytes())
-                    .map_err(|e| format!("Failed to write to pipe: {}", e))?;
+                std::io::Write::write_all(&mut pipe, json_str.as_bytes())?;
                     
                 Ok(())
             })();

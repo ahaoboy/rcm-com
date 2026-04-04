@@ -3,24 +3,26 @@ use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Shell::*;
 use windows::core::PCWSTR;
 
+use crate::error::{RcmError, Result};
+
 // python -c "import uuid; print(str(uuid.uuid5(uuid.NAMESPACE_URL, 'https://github.com/ahaoboy/rcm-com.git')).upper())"
 // UUID v5 of "https://github.com/ahaoboy/rcm-com.git"
 const CLSID_STR: &str = "{F96C1A16-22B8-5B5F-AEF4-B5E45A312B00}";
 const HANDLER_NAME: &str = "RcmContextMenu";
 
-fn dll_path() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("Failed to get exe path: {e}"))?;
+fn dll_path() -> Result<PathBuf> {
+    let exe = std::env::current_exe().map_err(|e| RcmError::Environment(format!("Failed to get exe path: {e}")))?;
     let dir = exe
         .parent()
-        .ok_or_else(|| "Failed to get exe directory".to_string())?;
+        .ok_or_else(|| RcmError::Environment("Failed to get exe directory".to_string()))?;
     let dll = dir.join("rcm_com.dll");
     if !dll.exists() {
-        return Err(format!("DLL not found at {}", dll.display()));
+        return Err(RcmError::Environment(format!("DLL not found at {}", dll.display())));
     }
     Ok(dll)
 }
 
-fn set_reg_value(key: HKEY, name: Option<&str>, value: &str) -> Result<(), String> {
+fn set_reg_value(key: HKEY, name: Option<&str>, value: &str) -> Result<()> {
     let wide_val: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
     let name_wide: Option<Vec<u16>> =
         name.map(|n| n.encode_utf16().chain(std::iter::once(0)).collect());
@@ -41,17 +43,17 @@ fn set_reg_value(key: HKEY, name: Option<&str>, value: &str) -> Result<(), Strin
             )),
         )
         .ok()
-        .map_err(|e| format!("RegSetValueExW failed: {e}"))
+        .map_err(|e| RcmError::Registry(format!("RegSetValueExW failed: {e}")))
     }
 }
 
-fn create_key(parent: HKEY, subkey: &str) -> Result<HKEY, String> {
+fn create_key(parent: HKEY, subkey: &str) -> Result<HKEY> {
     let wide: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
     let mut key = HKEY::default();
     unsafe {
         RegCreateKeyW(parent, PCWSTR(wide.as_ptr()), &mut key)
             .ok()
-            .map_err(|e| format!("RegCreateKeyW({subkey}) failed: {e}"))?;
+            .map_err(|e| RcmError::Registry(format!("RegCreateKeyW({subkey}) failed: {e}")))?;
     }
     Ok(key)
 }
@@ -63,7 +65,7 @@ fn delete_key(parent: HKEY, subkey: &str) {
     }
 }
 
-pub fn register() -> Result<(), String> {
+pub fn register() -> Result<()> {
     let dll = dll_path()?;
     let dll_str = dll.to_string_lossy();
 
@@ -121,7 +123,7 @@ pub fn register() -> Result<(), String> {
     Ok(())
 }
 
-pub fn unregister() -> Result<(), String> {
+pub fn unregister() -> Result<()> {
     println!("Unregistering shell extension...");
 
     // Remove handler registrations
