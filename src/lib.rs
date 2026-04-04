@@ -18,8 +18,8 @@ use windows::core::{GUID, HRESULT};
 // Constants
 // =============================================================================
 
-// {B8A0E19C-4C6D-4A82-9F3B-6E8E7D1F2A5C}
-const CLSID_RCM: GUID = GUID::from_u128(0xB8A0E19C_4C6D_4A82_9F3B_6E8E7D1F2A5C);
+// UUID v5 of "https://github.com/ahaoboy/rcm-com.git"
+const CLSID_RCM: GUID = GUID::from_u128(0xF96C1A16_22B8_5B5F_AEF4_B5E45A312B00);
 
 const IID_IUNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_C000_000000000046);
 const IID_ICLASSFACTORY: GUID = GUID::from_u128(0x00000001_0000_0000_C000_000000000046);

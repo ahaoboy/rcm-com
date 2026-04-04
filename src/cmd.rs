@@ -12,7 +12,9 @@ pub struct ExtensionConfig {
     pub cid: String,
 }
 
-const CLSID_STR: &str = "{B8A0E19C-4C6D-4A82-9F3B-6E8E7D1F2A5C}";
+// python -c "import uuid; print(str(uuid.uuid5(uuid.NAMESPACE_URL, 'https://github.com/ahaoboy/rcm-com.git')).upper())"
+// UUID v5 of "https://github.com/ahaoboy/rcm-com.git"
+const CLSID_STR: &str = "{F96C1A16-22B8-5B5F-AEF4-B5E45A312B00}";
 const HANDLER_NAME: &str = "RcmContextMenu";
 
 fn dll_path() -> Result<PathBuf, String> {
