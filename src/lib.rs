@@ -52,6 +52,17 @@ fn log_path() -> Option<std::path::PathBuf> {
     dll_dir().map(|d| d.join("log.txt"))
 }
 
+fn write_error(err: impl std::fmt::Display) {
+    if let Some(path) = dll_dir().map(|d| d.join("err.txt"))
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(file, "[{}] Error: {}", timestamp(), err);
+        }
+}
+
 /// Compute a UTC timestamp string without external dependencies.
 /// Uses Howard Hinnant's civil_from_days algorithm.
 fn timestamp() -> String {
@@ -539,22 +550,36 @@ unsafe extern "system" fn handler_query_context_menu(
             info.write_to_log();
 
             if let Some(dll_path) = dll_dir() {
-                let config_path = dll_path.join("rcm_config.json");
-                if let Ok(config_data) = std::fs::read_to_string(config_path)
-                    && let Ok(config) = serde_json::from_str::<ExtensionConfig>(&config_data) {
-                        info.cid = config.cid.clone();
+                let execute_result = (|| -> Result<(), String> {
+                    let config_path = dll_path.join("rcm_config.json");
+                    let config_data = std::fs::read_to_string(&config_path)
+                        .map_err(|e| format!("Failed to read {:?}: {}", config_path, e))?;
+                    
+                    let config = serde_json::from_str::<ExtensionConfig>(&config_data)
+                        .map_err(|e| format!("Failed to parse rcm_config.json: {}", e))?;
+                    
+                    info.cid = config.cid.clone();
 
-                        if let Ok(json_str) = serde_json::to_string(&*info) {
-                            let mut cmd = Command::new(&config.program);
-                            if let Some(ref args_str) = config.args {
-                                for arg in args_str.split_whitespace() {
-                                    cmd.arg(arg);
-                                }
-                            }
-                            cmd.arg(json_str);
-                            let _ = cmd.spawn();
+                    let json_str = serde_json::to_string(&*info)
+                        .map_err(|e| format!("Failed to serialize context info: {}", e))?;
+
+                    let mut cmd = Command::new(&config.program);
+                    if let Some(ref args_str) = config.args {
+                        for arg in args_str.split_whitespace() {
+                            cmd.arg(arg);
                         }
                     }
+                    cmd.arg(json_str);
+                    
+                    cmd.spawn()
+                        .map_err(|e| format!("Failed to spawn command '{}': {}", config.program, e))?;
+                        
+                    Ok(())
+                })();
+                
+                if let Err(err) = execute_result {
+                    write_error(err);
+                }
             }
         }
         HRESULT(0) // 0 items added
