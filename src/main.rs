@@ -1,4 +1,6 @@
 use clap::{Parser, Subcommand};
+use tokio::io::AsyncReadExt;
+use tokio::net::windows::named_pipe::ServerOptions;
 
 mod cmd;
 
@@ -12,35 +14,62 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Register the shell extension (requires admin)
-    #[command(alias = "reg")]
-    Register {
-        /// The program to execute when invoked
-        program: String,
-
-        /// Arguments for the program
-        #[arg(short, long)]
-        args: Option<String>,
-
-        /// CID
-        #[arg(short, long)]
-        cid: String,
-    },
-    /// Unregister the shell extension (requires admin)
-    #[command(alias = "unreg")]
-    Unregister,
+    /// Install and register the shell extension (requires admin)
+    Install,
+    /// Uninstall and unregister the shell extension (requires admin)
+    Uninstall,
+    /// Start listening for context menu events via named pipe
+    Start,
 }
 
-fn main() {
+const PIPE_NAME: &str = r"\\.\pipe\rcm_com_pipe";
+
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
 
-    let result = match cli.command {
-        Commands::Register { program, args, cid } => cmd::register(program, args, cid),
-        Commands::Unregister => cmd::unregister(),
+    let result: Result<(), String> = match cli.command {
+        Commands::Install => cmd::register(),
+        Commands::Uninstall => cmd::unregister(),
+        Commands::Start => {
+            if let Err(e) = run_server().await {
+                Err(format!("Server error: {e}"))
+            } else {
+                Ok(())
+            }
+        }
     };
 
     if let Err(e) = result {
         eprintln!("Error: {e}");
         std::process::exit(1);
+    }
+}
+
+async fn run_server() -> std::io::Result<()> {
+    println!("Listening for Explorer context menu events on pipe: {}", PIPE_NAME);
+    
+    // Create the first instance of the server pipe
+    let mut server = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(PIPE_NAME)?;
+
+    loop {
+        // Wait for a client to connect
+        server.connect().await?;
+
+        // Read all data from the connected client
+        let mut buf = vec![];
+        server.read_to_end(&mut buf).await?;
+
+        if let Ok(json_str) = String::from_utf8(buf) {
+            println!("{}", json_str);
+        } else {
+            eprintln!("Received invalid UTF-8 payload");
+        }
+
+        // Drop the old server instance
+        // Create a new pipe server instance for the next client
+        server = ServerOptions::new().create(PIPE_NAME)?;
     }
 }

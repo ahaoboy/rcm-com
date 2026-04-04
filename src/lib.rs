@@ -3,10 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::ffi::c_void;
 use std::io::Write;
-use std::process::Command;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 pub mod cmd;
-use cmd::ExtensionConfig;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::System::SystemServices::*;
@@ -62,9 +60,6 @@ fn dll_dir() -> Option<std::path::PathBuf> {
     path.parent().map(|p| p.to_path_buf())
 }
 
-fn log_path() -> Option<std::path::PathBuf> {
-    dll_dir().map(|d| d.join("log.txt"))
-}
 
 fn write_error(err: impl std::fmt::Display) {
     if let Some(path) = dll_dir().map(|d| d.join("err.txt"))
@@ -141,20 +136,6 @@ impl std::fmt::Display for ContextMenuInfo {
         }
         writeln!(f, "---")?;
         Ok(())
-    }
-}
-
-impl ContextMenuInfo {
-    fn write_to_log(&self) {
-        let Some(path) = log_path() else { return };
-        let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        else {
-            return;
-        };
-        let _ = write!(file, "{self}");
     }
 }
 
@@ -558,6 +539,8 @@ unsafe fn extract_selected_files(p_data_obj: *mut c_void, info: &mut ContextMenu
 
 // --- IContextMenu methods ---
 
+pub const PIPE_NAME: &str = r"\\.\pipe\rcm_com_pipe";
+
 unsafe extern "system" fn handler_query_context_menu(
     this: *mut c_void,
     _hmenu: isize,
@@ -568,41 +551,24 @@ unsafe extern "system" fn handler_query_context_menu(
 ) -> HRESULT {
     unsafe {
         let handler = &*handler_from_menu_ptr(this);
-        if let Ok(mut info) = handler.info.lock() {
-            info.write_to_log();
+        if let Ok(info) = handler.info.lock() {
+            let execute_result = (|| -> Result<(), String> {
+                let json_str = serde_json::to_string(&*info)
+                    .map_err(|e| format!("Failed to serialize context info: {}", e))?;
 
-            if let Some(dll_path) = dll_dir() {
-                let execute_result = (|| -> Result<(), String> {
-                    let config_path = dll_path.join("rcm_config.json");
-                    let config_data = std::fs::read_to_string(&config_path)
-                        .map_err(|e| format!("Failed to read {:?}: {}", config_path, e))?;
-
-                    let config = serde_json::from_str::<ExtensionConfig>(&config_data)
-                        .map_err(|e| format!("Failed to parse rcm_config.json: {}", e))?;
-
-                    info.cid = config.cid.clone();
-
-                    let json_str = serde_json::to_string(&*info)
-                        .map_err(|e| format!("Failed to serialize context info: {}", e))?;
-
-                    let mut cmd = Command::new(&config.program);
-                    if let Some(ref args_str) = config.args {
-                        for arg in args_str.split_whitespace() {
-                            cmd.arg(arg);
-                        }
-                    }
-                    cmd.arg(json_str);
-
-                    cmd.spawn().map_err(|e| {
-                        format!("Failed to spawn command '{}': {}", config.program, e)
-                    })?;
-
-                    Ok(())
-                })();
-
-                if let Err(err) = execute_result {
-                    write_error(err);
-                }
+                let mut pipe = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(PIPE_NAME)
+                    .map_err(|e| format!("Failed to connect to named pipe: {}", e))?;
+                
+                std::io::Write::write_all(&mut pipe, json_str.as_bytes())
+                    .map_err(|e| format!("Failed to write to pipe: {}", e))?;
+                    
+                Ok(())
+            })();
+            
+            if let Err(err) = execute_result {
+                write_error(err);
             }
         }
         HRESULT(0) // 0 items added

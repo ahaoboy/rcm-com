@@ -3,15 +3,6 @@ use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Shell::*;
 use windows::core::PCWSTR;
 
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ExtensionConfig {
-    pub program: String,
-    pub args: Option<String>,
-    pub cid: String,
-}
-
 // python -c "import uuid; print(str(uuid.uuid5(uuid.NAMESPACE_URL, 'https://github.com/ahaoboy/rcm-com.git')).upper())"
 // UUID v5 of "https://github.com/ahaoboy/rcm-com.git"
 const CLSID_STR: &str = "{F96C1A16-22B8-5B5F-AEF4-B5E45A312B00}";
@@ -72,18 +63,7 @@ fn delete_key(parent: HKEY, subkey: &str) {
     }
 }
 
-fn save_config(program: String, args: Option<String>, cid: String) -> Result<(), String> {
-    let dll = dll_path()?;
-    let dir = dll.parent().ok_or("Failed to get dll directory")?;
-    let config_path = dir.join("rcm_config.json");
-    let config = ExtensionConfig { program, args, cid };
-    let json = serde_json::to_string_pretty(&config)
-        .map_err(|e| format!("Failed to serialize config: {e}"))?;
-    std::fs::write(&config_path, json).map_err(|e| format!("Failed to write config: {e}"))?;
-    Ok(())
-}
-
-pub fn register(program: String, args: Option<String>, cid: String) -> Result<(), String> {
+pub fn register() -> Result<(), String> {
     let dll = dll_path()?;
     let dll_str = dll.to_string_lossy();
 
@@ -136,9 +116,6 @@ pub fn register(program: String, args: Option<String>, cid: String) -> Result<()
     unsafe {
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
     }
-
-    // Save config
-    save_config(program, args, cid)?;
 
     println!("Registration successful. Restart Explorer to apply.");
     Ok(())
