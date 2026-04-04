@@ -16,21 +16,26 @@ defaults:
 
 jobs:
   build:
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            RUSTFLAGS: -C target-feature=+crt-static
-    runs-on: ${{ matrix.os }}
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: run cross-build
-        uses: ahaoboy/cross-build@v1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          bin: rcm
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          target: ${{ matrix.target }}
-          RUSTFLAGS: ${{ matrix.RUSTFLAGS }}
-          tag: nightly
-          allowUpdates: true
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build release
+        run: cargo build --release
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref == 'refs/heads/main' && 'nightly' || github.ref_name }}
+          name: ${{ github.ref == 'refs/heads/main' && 'Nightly Release' || github.ref_name }}
+          prerelease: ${{ github.ref == 'refs/heads/main' }}
+          files: |
+            target/release/rcm.exe
+            target/release/rcm_com.dll
