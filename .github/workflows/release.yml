@@ -1,0 +1,36 @@
+name: Release
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - v[0-9]+.*
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -CeEuo pipefail {0}
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            RUSTFLAGS: -C target-feature=+crt-static
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: run cross-build
+        uses: ahaoboy/cross-build@v1
+        with:
+          bin: rcm
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          target: ${{ matrix.target }}
+          RUSTFLAGS: ${{ matrix.RUSTFLAGS }}
+          tag: nightly
+          allowUpdates: true
