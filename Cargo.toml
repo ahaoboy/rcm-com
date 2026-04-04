@@ -1,0 +1,24 @@
+[package]
+name = "rcm-com"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Ole",
+    "Win32_System_Registry",
+    "Win32_System_SystemServices",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[[bin]]
+path = "src/main.rs"
+name = "rcm"
