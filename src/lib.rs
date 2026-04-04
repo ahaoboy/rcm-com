@@ -34,7 +34,21 @@ static DLL_REF_COUNT: AtomicU32 = AtomicU32::new(0);
 // =============================================================================
 
 fn dll_dir() -> Option<std::path::PathBuf> {
-    let raw = DLL_MODULE.load(Ordering::SeqCst);
+    let mut raw = DLL_MODULE.load(Ordering::SeqCst);
+    if raw == 0 {
+        unsafe {
+            let mut hmodule = HMODULE::default();
+            let flags = 0x00000004 | 0x00000002; // FROM_ADDRESS | UNCHANGED_REFCOUNT
+            let addr = dll_dir as *const c_void as *const u16;
+            if GetModuleHandleExW(flags, windows::core::PCWSTR(addr), &mut hmodule).is_ok()
+                && !hmodule.is_invalid()
+            {
+                raw = hmodule.0 as usize;
+                DLL_MODULE.store(raw, Ordering::SeqCst);
+            }
+        }
+    }
+
     if raw == 0 {
         return None;
     }
@@ -58,9 +72,9 @@ fn write_error(err: impl std::fmt::Display) {
             .create(true)
             .append(true)
             .open(path)
-        {
-            let _ = writeln!(file, "[{}] Error: {}", timestamp(), err);
-        }
+    {
+        let _ = writeln!(file, "[{}] Error: {}", timestamp(), err);
+    }
 }
 
 /// Compute a UTC timestamp string without external dependencies.
@@ -463,6 +477,14 @@ unsafe extern "system" fn handler_initialize(
             extract_selected_files(p_data_obj, &mut info);
         }
 
+        // Context menus invoked on files (e.g. from HKCR\*) often pass a NULL pidlFolder.
+        // We can recover the directory path from the parent of the first selected file.
+        if info.folder_path.is_empty() && !info.selected_files.is_empty()
+            && let Some(first_file) = info.selected_files.first()
+                && let Some(parent) = std::path::Path::new(first_file).parent() {
+                    info.folder_path = parent.to_string_lossy().into_owned();
+                }
+
         info.is_background = info.selected_files.is_empty() && !info.folder_path.is_empty();
 
         // Window information
@@ -554,10 +576,10 @@ unsafe extern "system" fn handler_query_context_menu(
                     let config_path = dll_path.join("rcm_config.json");
                     let config_data = std::fs::read_to_string(&config_path)
                         .map_err(|e| format!("Failed to read {:?}: {}", config_path, e))?;
-                    
+
                     let config = serde_json::from_str::<ExtensionConfig>(&config_data)
                         .map_err(|e| format!("Failed to parse rcm_config.json: {}", e))?;
-                    
+
                     info.cid = config.cid.clone();
 
                     let json_str = serde_json::to_string(&*info)
@@ -570,13 +592,14 @@ unsafe extern "system" fn handler_query_context_menu(
                         }
                     }
                     cmd.arg(json_str);
-                    
-                    cmd.spawn()
-                        .map_err(|e| format!("Failed to spawn command '{}': {}", config.program, e))?;
-                        
+
+                    cmd.spawn().map_err(|e| {
+                        format!("Failed to spawn command '{}': {}", config.program, e)
+                    })?;
+
                     Ok(())
                 })();
-                
+
                 if let Err(err) = execute_result {
                     write_error(err);
                 }

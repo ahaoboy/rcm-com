@@ -137,7 +137,15 @@ Or log out and log back in.
 
 ### Step 5: Test
 
-1. Right-click any file, folder, or empty space in Explorer
+> [!IMPORTANT]
+> **Windows 11 Notice:** This shell extension uses the classic `IContextMenu` API. Windows 11 hides classic context menu items by default.
+> To trigger this extension on Windows 11, you must invoke the **Windows 10 style menu** by either:
+> - Clicking **"Show more options"** (显示更多选项) at the bottom of the new right-click menu.
+> - Holding **Shift** while right-clicking.
+> 
+> The DLL will *only* be loaded and execute the log writing when the classic menu is actively shown.
+
+1. Right-click any file, folder, or empty space in Explorer (Use Shift+Right-Click on Windows 11)
 2. Check `C:\rcm\log.txt` (same directory as the DLL)
 
 Example log output:
@@ -167,12 +175,13 @@ start explorer.exe
 ## CLSID
 
 ```
-{B8A0E19C-4C6D-4A82-9F3B-6E8E7D1F2A5C}
+{F96C1A16-22B8-5B5F-AEF4-B5E45A312B00}
 ```
 
 ## Troubleshooting
 
+- **Windows 11**: If you don't see any logs generated, ensure you are holding `Shift` while right-clicking, or clicking "Show more options" to reveal the classic context menu. The modern Win11 right-click menu will ignore this DLL.
 - **log.txt not created**: Ensure the DLL directory is writable. Shell extensions run inside `explorer.exe` which may have restricted write access to certain directories.
 - **No effect after registration**: Restart Explorer (`taskkill /f /im explorer.exe && start explorer.exe`).
 - **Registration fails**: Must run `rcm.exe register` from an elevated (Administrator) command prompt.
-- **DLL not loading**: Verify the DLL path in registry matches the actual file location. Check with `reg query "HKCR\CLSID\{B8A0E19C-4C6D-4A82-9F3B-6E8E7D1F2A5C}\InProcServer32"`.
+- **DLL not loading**: Verify the DLL path in registry matches the actual file location. Check with `reg query "HKCR\CLSID\{F96C1A16-22B8-5B5F-AEF4-B5E45A312B00}\InProcServer32"`.
