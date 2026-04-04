@@ -30,12 +30,15 @@ jobs:
         env:
           RUSTFLAGS: -C target-feature=+crt-static
 
+      - name: Package release
+        run: |
+          cd target/release
+          7z a -tzip ../../rcm-x86_64-pc-windows-msvc.zip rcm.exe rcm_com.dll
+
       - name: Publish Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref == 'refs/heads/main' && 'nightly' || github.ref_name }}
           name: ${{ github.ref == 'refs/heads/main' && 'Nightly Release' || github.ref_name }}
           prerelease: ${{ github.ref == 'refs/heads/main' }}
-          files: |
-            target/release/rcm.exe
-            target/release/rcm_com.dll
+          files: rcm-x86_64-pc-windows-msvc.zip
