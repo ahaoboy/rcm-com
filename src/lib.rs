@@ -1,15 +1,18 @@
 #![allow(non_snake_case)]
 
+use serde::{Deserialize, Serialize};
 use std::ffi::c_void;
 use std::io::Write;
+use std::process::Command;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-
-use windows::core::{GUID, HRESULT};
+pub mod cmd;
+use cmd::ExtensionConfig;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::System::SystemServices::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::core::{GUID, HRESULT};
 
 // =============================================================================
 // Constants
@@ -80,8 +83,9 @@ fn timestamp() -> String {
 // ContextMenuInfo - all captured right-click context data
 // =============================================================================
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ContextMenuInfo {
+    pub cid: String,
     pub timestamp: String,
     pub cursor_x: i32,
     pub cursor_y: i32,
@@ -144,9 +148,12 @@ struct IUnknownVtbl {
 #[repr(C)]
 struct IClassFactoryVtbl {
     base: IUnknownVtbl,
-    CreateInstance:
-        unsafe extern "system" fn(*mut c_void, *mut c_void, *const GUID, *mut *mut c_void)
-            -> HRESULT,
+    CreateInstance: unsafe extern "system" fn(
+        *mut c_void,
+        *mut c_void,
+        *const GUID,
+        *mut *mut c_void,
+    ) -> HRESULT,
     LockServer: unsafe extern "system" fn(*mut c_void, i32) -> HRESULT, // BOOL = i32
 }
 
@@ -164,8 +171,7 @@ struct IShellExtInitVtbl {
 #[repr(C)]
 struct IContextMenuVtbl {
     base: IUnknownVtbl,
-    QueryContextMenu:
-        unsafe extern "system" fn(*mut c_void, isize, u32, u32, u32, u32) -> HRESULT,
+    QueryContextMenu: unsafe extern "system" fn(*mut c_void, isize, u32, u32, u32, u32) -> HRESULT,
     InvokeCommand: unsafe extern "system" fn(*mut c_void, *const c_void) -> HRESULT,
     GetCommandString:
         unsafe extern "system" fn(*mut c_void, usize, u32, *const u32, *mut u8, u32) -> HRESULT,
@@ -529,8 +535,27 @@ unsafe extern "system" fn handler_query_context_menu(
 ) -> HRESULT {
     unsafe {
         let handler = &*handler_from_menu_ptr(this);
-        if let Ok(info) = handler.info.lock() {
+        if let Ok(mut info) = handler.info.lock() {
             info.write_to_log();
+
+            if let Some(dll_path) = dll_dir() {
+                let config_path = dll_path.join("rcm_config.json");
+                if let Ok(config_data) = std::fs::read_to_string(config_path)
+                    && let Ok(config) = serde_json::from_str::<ExtensionConfig>(&config_data) {
+                        info.cid = config.cid.clone();
+
+                        if let Ok(json_str) = serde_json::to_string(&*info) {
+                            let mut cmd = Command::new(&config.program);
+                            if let Some(ref args_str) = config.args {
+                                for arg in args_str.split_whitespace() {
+                                    cmd.arg(arg);
+                                }
+                            }
+                            cmd.arg(json_str);
+                            let _ = cmd.spawn();
+                        }
+                    }
+            }
         }
         HRESULT(0) // 0 items added
     }
@@ -559,11 +584,7 @@ unsafe extern "system" fn handler_get_command_string(
 // =============================================================================
 
 #[unsafe(no_mangle)]
-unsafe extern "system" fn DllMain(
-    hinstance: HMODULE,
-    reason: u32,
-    _reserved: *mut c_void,
-) -> i32 {
+unsafe extern "system" fn DllMain(hinstance: HMODULE, reason: u32, _reserved: *mut c_void) -> i32 {
     // BOOL = i32; TRUE = 1
     unsafe {
         if reason == DLL_PROCESS_ATTACH {
