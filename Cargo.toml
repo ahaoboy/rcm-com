@@ -2,6 +2,11 @@
 name = "rcm-com"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "rcm-com"
+repository = "https://github.com/ahaoboy/rcm-com"
+homepage = "https://github.com/ahaoboy/rcm-com"
+authors = ["ahaoboy"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
