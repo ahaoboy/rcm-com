@@ -17,6 +17,8 @@ enum Commands {
     Uninstall,
     /// Start listening for context menu events via named pipe
     Start,
+    /// Show current registration status and configuration
+    Status,
 }
 
 #[tokio::main]
@@ -33,6 +35,7 @@ async fn main() {
             })
             .await
         }
+        Commands::Status => cmd::status(),
     };
 
     if let Err(e) = result {

@@ -40,4 +40,7 @@ jobs:
         with:
           tag_name: ${{ github.ref == 'refs/heads/main' && 'nightly' || github.ref_name }}
           name: ${{ github.ref == 'refs/heads/main' && 'Nightly Release' || github.ref_name }}
-          files: rcm-x86_64-pc-windows-msvc.zip
+          files: |
+            rcm-x86_64-pc-windows-msvc.zip
+            rcm.exe
+            rcm_com.dll
