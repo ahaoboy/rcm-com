@@ -27,6 +27,8 @@ jobs:
 
       - name: Install
         run: |
+          cargo build --release
+          cp target/release/rcm_com.dll "$CARGO_HOME/bin/"
           cargo install --path .
 
       - name: Run status
