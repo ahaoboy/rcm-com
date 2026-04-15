@@ -25,8 +25,19 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Build release
-        run: cargo build --release
+      - name: Run
+        run: |
+          cargo install --path .
+
+          rcm status
+
+          rcm install
+
+          rcm status
+
+          rcm uninstall
+
+          rcm status
         env:
           RUSTFLAGS: -C target-feature=+crt-static
 
