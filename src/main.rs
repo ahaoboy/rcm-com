@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use rcm_com::{cmd, error::Result, server::listen, PIPE_NAME};
+use rcm_com::{PIPE_NAME, cmd, error::Result, server::listen};
 
 #[derive(Parser)]
 #[command(name = "rcm")]
@@ -29,7 +29,10 @@ async fn main() {
         Commands::Install => cmd::register(),
         Commands::Uninstall => cmd::unregister(),
         Commands::Start => {
-            println!("Listening for Explorer context menu events on pipe: {}", PIPE_NAME);
+            println!(
+                "Listening for Explorer context menu events on pipe: {}",
+                PIPE_NAME
+            );
             listen(|info| {
                 println!("{:#?}", info);
             })
@@ -40,6 +43,5 @@ async fn main() {
 
     if let Err(e) = result {
         eprintln!("Error: {e}");
-        std::process::exit(1);
     }
 }

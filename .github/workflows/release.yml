@@ -25,10 +25,12 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Run
+      - name: Install
         run: |
           cargo install --path .
 
+      - name: Run status
+        run: |
           rcm status
 
           rcm install
