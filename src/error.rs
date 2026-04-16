@@ -11,11 +11,17 @@ pub enum RcmError {
     #[error("Registry Error: {0}")]
     Registry(String),
 
+    #[error("Registry Key Not Found: {0}")]
+    RegistryKeyNotFound(String),
+
     #[error("Environment Error: {0}")]
     Environment(String),
 
     #[error("UTF-8 Decoding Error: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
+
+    #[error("Windows Error: {0}")]
+    Windows(#[from] windows::core::Error),
 }
 
 pub type Result<T> = std::result::Result<T, RcmError>;

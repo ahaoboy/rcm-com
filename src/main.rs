@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use rcm_com::{PIPE_NAME, cmd, error::Result, server::listen};
+use rcm_com::{PIPE_NAME, cmd, server::listen};
 
 #[derive(Parser)]
 #[command(name = "rcm")]
@@ -25,7 +25,7 @@ enum Commands {
 async fn main() {
     let cli = Cli::parse();
 
-    let result: Result<()> = match cli.command {
+    let result = match cli.command {
         Commands::Install => cmd::register(),
         Commands::Uninstall => cmd::unregister(),
         Commands::Start => {
@@ -38,7 +38,9 @@ async fn main() {
             })
             .await
         }
-        Commands::Status => cmd::status(),
+        Commands::Status => cmd::status().map(|s| {
+            println!("{s}");
+        }),
     };
 
     if let Err(e) = result {
