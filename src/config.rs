@@ -10,8 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Holds the user-configurable behaviour knobs loaded from the JSON file.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RcmConfig {
     /// If true, write diagnostic logs to `{dll_name}.log`.
     #[serde(default)]
@@ -39,7 +38,7 @@ fn load_config() -> Option<RcmConfig> {
 /// Returns the full path to `{dll_stem}.json`, or `None` if the DLL directory
 /// cannot be determined.
 pub fn config_path() -> Option<std::path::PathBuf> {
-    let dll_path = crate::dll_path()?;
+    let dll_path = crate::helpers::dll_path()?;
     let stem = dll_path.file_stem()?;
     Some(dll_path.parent()?.join(format!("{}.json", stem.to_string_lossy())))
 }
@@ -47,7 +46,7 @@ pub fn config_path() -> Option<std::path::PathBuf> {
 /// Returns the full path to `{dll_stem}.log`, or `None` if the DLL directory
 /// cannot be determined.
 pub fn log_path() -> Option<std::path::PathBuf> {
-    let dll_path = crate::dll_path()?;
+    let dll_path = crate::helpers::dll_path()?;
     let stem = dll_path.file_stem()?;
     Some(dll_path.parent()?.join(format!("{}.log", stem.to_string_lossy())))
 }
