@@ -16,7 +16,6 @@ use windows::Win32::System::SystemServices::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{GUID, HRESULT};
-
 // =============================================================================
 // Constants
 // =============================================================================
@@ -686,6 +685,43 @@ unsafe extern "system" fn handler_query_context_menu(
 
         #[cfg(feature = "config")]
         if crate::config::get_config().block_win11_menu {
+            if let Ok(info) = handler.info.lock() {
+                if info.window_handle != 0 {
+                    let hwnd_val = info.window_handle;
+                    
+                    // Prevent DLL from unloading while thread is active
+                    crate::DLL_REF_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        unsafe {
+                            let hwnd_orig = HWND(hwnd_val as *mut _);
+                            let thread_id = GetWindowThreadProcessId(hwnd_orig, None);
+                            
+                            let mut gui_info = GUITHREADINFO {
+                                cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+                                ..Default::default()
+                            };
+                            
+                            // Query the GUI state of the specific Explorer thread
+                            if GetGUIThreadInfo(thread_id, &mut gui_info).is_ok() {
+                                if !gui_info.hwndMenuOwner.0.is_null() {
+                                    // Found the precise window owning the menu, send WM_CANCELMODE
+                                    let _ = PostMessageW(Some(gui_info.hwndMenuOwner), WM_CANCELMODE, WPARAM(0), LPARAM(0));
+                                } else {
+                                    // Fallback to original window
+                                    let _ = PostMessageW(Some(hwnd_orig), WM_CANCELMODE, WPARAM(0), LPARAM(0));
+                                }
+                            } else {
+                                let _ = PostMessageW(Some(hwnd_orig), WM_CANCELMODE, WPARAM(0), LPARAM(0));
+                            }
+                        }
+                        
+                        // Release DLL lock
+                        crate::DLL_REF_COUNT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    });
+                }
+            }
             return E_FAIL;
         }
 
