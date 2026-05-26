@@ -8,6 +8,10 @@ repository = "https://github.com/ahaoboy/rcm-com"
 homepage = "https://github.com/ahaoboy/rcm-com"
 authors = ["ahaoboy"]
 
+[features]
+default = ["config"]
+config = []
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 

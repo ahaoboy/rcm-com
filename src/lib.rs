@@ -8,6 +8,8 @@ pub mod cmd;
 pub mod consts;
 pub mod error;
 pub mod server;
+#[cfg(feature = "config")]
+pub mod config;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::System::SystemServices::*;
@@ -28,7 +30,7 @@ static DLL_REF_COUNT: AtomicU32 = AtomicU32::new(0);
 // Helpers
 // =============================================================================
 
-fn dll_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn dll_dir() -> Option<std::path::PathBuf> {
     let mut raw = DLL_MODULE.load(Ordering::SeqCst);
     if raw == 0 {
         unsafe {
@@ -58,14 +60,61 @@ fn dll_dir() -> Option<std::path::PathBuf> {
 }
 
 
-fn write_error(err: impl std::fmt::Display) {
+/// Returns the full path to the DLL file itself, not just its directory.
+#[cfg_attr(not(feature = "config"), allow(dead_code))]
+pub(crate) fn dll_path() -> Option<std::path::PathBuf> {
+    let mut raw = DLL_MODULE.load(Ordering::SeqCst);
+    if raw == 0 {
+        unsafe {
+            let mut hmodule = HMODULE::default();
+            let flags = 0x00000004 | 0x00000002;
+            let addr = dll_path as *const c_void as *const u16;
+            if GetModuleHandleExW(flags, windows::core::PCWSTR(addr), &mut hmodule).is_ok()
+                && !hmodule.is_invalid()
+            {
+                raw = hmodule.0 as usize;
+                DLL_MODULE.store(raw, Ordering::SeqCst);
+            }
+        }
+    }
+    if raw == 0 {
+        return None;
+    }
+    let module = HMODULE(raw as *mut c_void);
+    let mut buf = vec![0u16; 1024];
+    let len = unsafe { GetModuleFileNameW(Some(module), &mut buf) } as usize;
+    if len == 0 {
+        return None;
+    }
+    Some(std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len])))
+}
+
+/// Write a diagnostic log entry.  When the `config` feature is active and
+/// `config.log == true`, the entry is appended to `{dll_stem}.log`.
+/// Otherwise it is written to `err.txt` (error-only fallback).
+fn write_log(err: impl std::fmt::Display) {
+    #[cfg(feature = "config")]
+    {
+        if crate::config::get_config().log {
+            if let Some(path) = crate::config::log_path()
+                && let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+            {
+                let _ = writeln!(file, "[{}] {}", timestamp(), err);
+                return;
+            }
+        }
+    }
+    // Fallback: always write to err.txt so we don't lose error visibility.
     if let Some(path) = dll_dir().map(|d| d.join("err.txt"))
         && let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
     {
-        let _ = writeln!(file, "[{}] Error: {}", timestamp(), err);
+        let _ = writeln!(file, "[{}] {}", timestamp(), err);
     }
 }
 
@@ -624,16 +673,22 @@ unsafe extern "system" fn handler_query_context_menu(
                 let mut pipe = std::fs::OpenOptions::new()
                     .write(true)
                     .open(PIPE_NAME)?;
-                
+
                 std::io::Write::write_all(&mut pipe, json_str.as_bytes())?;
-                    
+
                 Ok(())
             })();
-            
+
             if let Err(err) = execute_result {
-                write_error(err);
+                write_log(err);
             }
         }
+
+        #[cfg(feature = "config")]
+        if crate::config::get_config().block_win11_menu {
+            return E_FAIL;
+        }
+
         HRESULT(0) // 0 items added
     }
 }

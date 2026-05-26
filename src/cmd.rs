@@ -89,11 +89,11 @@ fn get_reg_value(key: HKEY, name: Option<&str>) -> Result<String> {
     unsafe {
         RegQueryValueExW(key, name_pcwstr, None, None, None, Some(&mut buf_len)).ok()
             .map_err(|e| RcmError::Registry(format!("RegQueryValueExW length failed: {e}")))?;
-        
+
         let mut buf = vec![0u8; buf_len as usize];
         RegQueryValueExW(key, name_pcwstr, None, None, Some(buf.as_mut_ptr()), Some(&mut buf_len)).ok()
             .map_err(|e| RcmError::Registry(format!("RegQueryValueExW failed: {e}")))?;
-        
+
         Ok(String::from_utf16_lossy(std::slice::from_raw_parts(buf.as_ptr() as *const u16, (buf_len / 2) as usize))
             .trim_matches(char::from(0))
             .to_string())
@@ -201,6 +201,9 @@ pub struct Status {
     pub handler_directory_ok: bool,
     pub handler_background_ok: bool,
     pub is_approved: bool,
+    pub config_path: Option<PathBuf>,
+    pub config_log_enabled: bool,
+    pub config_block_win11_menu: bool,
 }
 
 impl Status {
@@ -267,6 +270,21 @@ impl Display for Status {
         }
 
         writeln!(f)?;
+        writeln!(f, "Config:")?;
+        if let Some(ref cfg_path) = self.config_path {
+            if cfg_path.exists() {
+                writeln!(f, "  ✅ Config file: {}", cfg_path.display())?;
+                writeln!(f, "     log:              {}", self.config_log_enabled)?;
+                writeln!(f, "     block_win11_menu: {}", self.config_block_win11_menu)?;
+            } else {
+                writeln!(f, "  ⚠️  Config file not found: {}", cfg_path.display())?;
+                writeln!(f, "     (defaults: log=false, block_win11_menu=false)")?;
+            }
+        } else {
+            writeln!(f, "  ⚠️  Cannot determine config file path (DLL location unknown)")?;
+        }
+
+        writeln!(f)?;
         if self.is_valid() {
             writeln!(f, "Overall Status: ✅ All items are valid.")?;
         } else {
@@ -279,7 +297,7 @@ impl Display for Status {
 
 pub fn status() -> Result<Status> {
     let dll = dll_path().ok();
-    
+
     let mut status = Status {
         pipe_name: crate::PIPE_NAME.to_string(),
         dll_path: dll,
@@ -291,7 +309,19 @@ pub fn status() -> Result<Status> {
         handler_directory_ok: false,
         handler_background_ok: false,
         is_approved: false,
+        config_path: None,
+        config_log_enabled: false,
+        config_block_win11_menu: false,
     };
+
+    // Config file path & values
+    #[cfg(feature = "config")]
+    {
+        status.config_path = crate::config::config_path();
+        let cfg = crate::config::reload_config().unwrap_or_default();
+        status.config_log_enabled = cfg.log;
+        status.config_block_win11_menu = cfg.block_win11_menu;
+    }
 
     // Registry: CLSID
     let clsid_path = format!("CLSID\\{CLSID_STR}");
