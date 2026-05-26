@@ -7,6 +7,30 @@ use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Shell::*;
 use windows::core::PCWSTR;
 
+// ── helpers ────────────────────────────────────────────────────────────────
+
+/// Convert `&str` to a null-terminated wide string.
+fn to_wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// RAII wrapper that calls `RegCloseKey` on drop.
+struct RegKeyGuard(HKEY);
+
+impl RegKeyGuard {
+    fn new(key: HKEY) -> Self {
+        Self(key)
+    }
+}
+
+impl Drop for RegKeyGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe { let _ = RegCloseKey(self.0); }
+        }
+    }
+}
+
 fn dll_path() -> Result<PathBuf> {
     let exe = std::env::current_exe().map_err(|e| RcmError::Environment(format!("Failed to get exe path: {e}")))?;
     let dir = exe
@@ -20,9 +44,9 @@ fn dll_path() -> Result<PathBuf> {
 }
 
 fn set_reg_value(key: HKEY, name: Option<&str>, value: &str) -> Result<()> {
-    let wide_val: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide_val = to_wide(value);
     let name_wide: Option<Vec<u16>> =
-        name.map(|n| n.encode_utf16().chain(std::iter::once(0)).collect());
+        name.map(to_wide);
     let name_pcwstr = name_wide
         .as_ref()
         .map(|v| PCWSTR(v.as_ptr()))
@@ -45,7 +69,7 @@ fn set_reg_value(key: HKEY, name: Option<&str>, value: &str) -> Result<()> {
 }
 
 fn create_key(parent: HKEY, subkey: &str) -> Result<HKEY> {
-    let wide: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide = to_wide(subkey);
     let mut key = HKEY::default();
     unsafe {
         RegCreateKeyW(parent, PCWSTR(wide.as_ptr()), &mut key)
@@ -55,15 +79,17 @@ fn create_key(parent: HKEY, subkey: &str) -> Result<HKEY> {
     Ok(key)
 }
 
-fn delete_key(parent: HKEY, subkey: &str) {
-    let wide: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
+fn delete_key(parent: HKEY, subkey: &str) -> Result<()> {
+    let wide = to_wide(subkey);
     unsafe {
-        let _ = RegDeleteTreeW(parent, PCWSTR(wide.as_ptr()));
+        RegDeleteTreeW(parent, PCWSTR(wide.as_ptr()))
+            .ok()
+            .map_err(|e| RcmError::Registry(format!("RegDeleteTreeW({subkey}) failed: {e}")))
     }
 }
 
 fn open_key(parent: HKEY, subkey: &str) -> Result<HKEY> {
-    let wide: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide = to_wide(subkey);
     let mut key = HKEY::default();
     unsafe {
         let res = RegOpenKeyExW(parent, PCWSTR(wide.as_ptr()), Some(0), KEY_READ, &mut key);
@@ -79,7 +105,7 @@ fn open_key(parent: HKEY, subkey: &str) -> Result<HKEY> {
 
 fn get_reg_value(key: HKEY, name: Option<&str>) -> Result<String> {
     let name_wide: Option<Vec<u16>> =
-        name.map(|n| n.encode_utf16().chain(std::iter::once(0)).collect());
+        name.map(to_wide);
     let name_pcwstr = name_wide
         .as_ref()
         .map(|v| PCWSTR(v.as_ptr()))
@@ -118,37 +144,30 @@ pub fn register() -> Result<()> {
 
     // HKCR\CLSID\{GUID}
     let clsid_path = format!("CLSID\\{CLSID_STR}");
-    let key = create_key(HKEY_CLASSES_ROOT, &clsid_path)?;
-    set_reg_value(key, None, "RCM Context Menu Handler")?;
-    unsafe {
-        let _ = RegCloseKey(key);
+    {
+        let _key = RegKeyGuard::new(create_key(HKEY_CLASSES_ROOT, &clsid_path)?);
+        set_reg_value(_key.0, None, "RCM Context Menu Handler")?;
     }
 
     // HKCR\CLSID\{GUID}\InProcServer32
     let inproc_path = format!("CLSID\\{CLSID_STR}\\InProcServer32");
-    let key = create_key(HKEY_CLASSES_ROOT, &inproc_path)?;
-    set_reg_value(key, None, &dll_str)?;
-    set_reg_value(key, Some("ThreadingModel"), "Apartment")?;
-    unsafe {
-        let _ = RegCloseKey(key);
+    {
+        let _key = RegKeyGuard::new(create_key(HKEY_CLASSES_ROOT, &inproc_path)?);
+        set_reg_value(_key.0, None, &dll_str)?;
+        set_reg_value(_key.0, Some("ThreadingModel"), "Apartment")?;
     }
 
     // Context menu handler registrations
     for path in get_handler_paths() {
-        let key = create_key(HKEY_CLASSES_ROOT, &path)?;
-        set_reg_value(key, None, CLSID_STR)?;
-        unsafe {
-            let _ = RegCloseKey(key);
-        }
+        let _key = RegKeyGuard::new(create_key(HKEY_CLASSES_ROOT, &path)?);
+        set_reg_value(_key.0, None, CLSID_STR)?;
     }
 
     // Approved shell extensions
     let approved_path = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Shell Extensions\\Approved";
     if let Ok(key) = create_key(HKEY_LOCAL_MACHINE, approved_path) {
-        let _ = set_reg_value(key, Some(CLSID_STR), "RCM Context Menu Handler");
-        unsafe {
-            let _ = RegCloseKey(key);
-        }
+        let _key = RegKeyGuard::new(key);
+        let _ = set_reg_value(_key.0, Some(CLSID_STR), "RCM Context Menu Handler");
     }
 
     // Notify shell of changes
@@ -165,19 +184,19 @@ pub fn unregister() -> Result<()> {
 
     // Remove handler registrations
     for path in get_handler_paths() {
-        delete_key(HKEY_CLASSES_ROOT, &path);
+        delete_key(HKEY_CLASSES_ROOT, &path)?;
     }
 
     // Remove CLSID registration
-    delete_key(HKEY_CLASSES_ROOT, &format!("CLSID\\{CLSID_STR}"));
+    delete_key(HKEY_CLASSES_ROOT, &format!("CLSID\\{CLSID_STR}"))?;
 
     // Remove from Approved list
     let approved_path = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Shell Extensions\\Approved";
-    let wide_clsid: Vec<u16> = CLSID_STR.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide_clsid = to_wide(CLSID_STR);
     if let Ok(key) = create_key(HKEY_LOCAL_MACHINE, approved_path) {
+        let _key = RegKeyGuard::new(key);
         unsafe {
-            let _ = RegDeleteValueW(key, PCWSTR(wide_clsid.as_ptr()));
-            let _ = RegCloseKey(key);
+            let _ = RegDeleteValueW(_key.0, PCWSTR(wide_clsid.as_ptr()));
         }
     }
 
@@ -318,7 +337,7 @@ pub fn status() -> Result<Status> {
     #[cfg(feature = "config")]
     {
         status.config_path = crate::config::config_path();
-        let cfg = crate::config::reload_config().unwrap_or_default();
+        let cfg = crate::config::get_config();
         status.config_log_enabled = cfg.log;
         status.config_block_win11_menu = cfg.block_win11_menu;
     }
@@ -326,16 +345,16 @@ pub fn status() -> Result<Status> {
     // Registry: CLSID
     let clsid_path = format!("CLSID\\{CLSID_STR}");
     if let Ok(key) = open_key(HKEY_CLASSES_ROOT, &clsid_path) {
+        let _key = RegKeyGuard::new(key);
         status.clsid_exists = true;
-        status.clsid_name = get_reg_value(key, None).ok();
-        unsafe { let _ = RegCloseKey(key); }
+        status.clsid_name = get_reg_value(_key.0, None).ok();
 
         // InProcServer32
         let inproc_path = format!("{clsid_path}\\InProcServer32");
         if let Ok(key) = open_key(HKEY_CLASSES_ROOT, &inproc_path) {
-            status.inproc_path = get_reg_value(key, None).ok();
-            status.threading_model = get_reg_value(key, Some("ThreadingModel")).ok();
-            unsafe { let _ = RegCloseKey(key); }
+            let _key = RegKeyGuard::new(key);
+            status.inproc_path = get_reg_value(_key.0, None).ok();
+            status.threading_model = get_reg_value(_key.0, Some("ThreadingModel")).ok();
         }
     }
 
@@ -343,8 +362,8 @@ pub fn status() -> Result<Status> {
     let handler_paths = get_handler_paths();
     let check_handler = |path: &str| -> bool {
         if let Ok(key) = open_key(HKEY_CLASSES_ROOT, path) {
-            let val = get_reg_value(key, None).unwrap_or_default();
-            let _ = unsafe { RegCloseKey(key) };
+            let _key = RegKeyGuard::new(key);
+            let val = get_reg_value(_key.0, None).unwrap_or_default();
             val == CLSID_STR
         } else {
             false
@@ -358,10 +377,10 @@ pub fn status() -> Result<Status> {
     // Approved
     let approved_path = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Shell Extensions\\Approved";
     if let Ok(key) = open_key(HKEY_LOCAL_MACHINE, approved_path) {
-        if get_reg_value(key, Some(CLSID_STR)).is_ok() {
+        let _key = RegKeyGuard::new(key);
+        if get_reg_value(_key.0, Some(CLSID_STR)).is_ok() {
             status.is_approved = true;
         }
-        unsafe { let _ = RegCloseKey(key); }
     }
 
     Ok(status)

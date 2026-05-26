@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::ffi::c_void;
 use std::io::Write;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicUsize, Ordering};
 pub mod cmd;
 pub mod consts;
 pub mod error;
@@ -13,9 +13,11 @@ pub mod config;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::System::SystemServices::*;
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{GUID, HRESULT};
+use chrono::Utc;
 // =============================================================================
 // Constants
 // =============================================================================
@@ -25,12 +27,85 @@ use crate::consts::*;
 static DLL_MODULE: AtomicUsize = AtomicUsize::new(0);
 static DLL_REF_COUNT: AtomicU32 = AtomicU32::new(0);
 
+// ---------------------------------------------------------------------------
+// WH_CBT hook — prevents context menu windows from being created
+// ---------------------------------------------------------------------------
+//
+// When a popup menu (window class #32768) is about to be created, the
+// HCBT_CREATEWND notification fires.  Returning non-zero from the CBT
+// hook procedure PREVENTS the window from being created entirely – the
+// menu never appears, no flash, no timing issues.
+//
+// Unlike inline hooks, this approach does NOT modify any code in memory.
+// The hook is installed per-right-click in IShellExtInit::Initialize and
+// unhooks itself on the first popup-menu creation it catches.
+
+/// Handle of the active WH_CBT hook (0 when not installed).
+/// Atomic to prevent data races between the hook callback and the
+/// installer running on different COM apartment threads.
+static CBT_HOOK_HANDLE: AtomicIsize = AtomicIsize::new(0);
+
+/// CBT hook procedure — called before windows are created on our thread.
+///
+/// When code == HCBT_CREATEWND (3), lparam points to a CBT_CREATEWNDW
+/// whose lpcs->lpszClass identifies the window class.  A popup menu has
+/// class atom 32768 (0x8000).  We return 1 to prevent its creation.
+unsafe extern "system" fn cbt_hook_proc(
+    code: i32,
+    _wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    // HCBT_CREATEWND = 3
+    if code == 3 {
+        unsafe {
+            // lparam → CBT_CREATEWNDW* → lpcs → CREATESTRUCTW*
+            let cbt_ptr = lparam.0 as *const CBT_CREATEWNDW;
+            if !cbt_ptr.is_null() {
+                let cs = &*(*cbt_ptr).lpcs;
+                // For system classes, lpszClass contains MAKEINTATOM(32768) = 0x8000
+                if cs.lpszClass.0 as usize == 32768 {
+                    // Prevent this popup menu window from being created.
+                    // Then unhook – we only need to catch the first one.
+                    let hook = CBT_HOOK_HANDLE.swap(0, Ordering::Acquire);
+                    if hook != 0 {
+                        let _ = UnhookWindowsHookEx(HHOOK(hook as *mut c_void));
+                    }
+                    return LRESULT(1);
+                }
+            }
+        }
+    }
+    // Not our target – pass to the next hook in the chain.
+    unsafe { CallNextHookEx(None, code, _wparam, lparam) }
+}
+
+/// Install a thread-local WH_CBT hook that blocks the next popup menu.
+fn install_cbt_menu_blocker() {
+    unsafe {
+        // Already installed – nothing to do.
+        if CBT_HOOK_HANDLE.load(Ordering::Acquire) != 0 {
+            return;
+        }
+
+        let hinstance = HINSTANCE(DLL_MODULE.load(Ordering::Acquire) as *mut c_void);
+        let hook = SetWindowsHookExW(
+            WH_CBT,
+            Some(cbt_hook_proc),
+            Some(hinstance),
+            GetCurrentThreadId(),
+        );
+        if let Ok(hook) = hook {
+            CBT_HOOK_HANDLE.store(hook.0 as isize, Ordering::Release);
+        }
+    }
+}
+
 // =============================================================================
 // Helpers
 // =============================================================================
 
 pub(crate) fn dll_dir() -> Option<std::path::PathBuf> {
-    let mut raw = DLL_MODULE.load(Ordering::SeqCst);
+    let mut raw = DLL_MODULE.load(Ordering::Acquire);
     if raw == 0 {
         unsafe {
             let mut hmodule = HMODULE::default();
@@ -40,7 +115,7 @@ pub(crate) fn dll_dir() -> Option<std::path::PathBuf> {
                 && !hmodule.is_invalid()
             {
                 raw = hmodule.0 as usize;
-                DLL_MODULE.store(raw, Ordering::SeqCst);
+                DLL_MODULE.store(raw, Ordering::Release);
             }
         }
     }
@@ -62,7 +137,7 @@ pub(crate) fn dll_dir() -> Option<std::path::PathBuf> {
 /// Returns the full path to the DLL file itself, not just its directory.
 #[cfg_attr(not(feature = "config"), allow(dead_code))]
 pub(crate) fn dll_path() -> Option<std::path::PathBuf> {
-    let mut raw = DLL_MODULE.load(Ordering::SeqCst);
+    let mut raw = DLL_MODULE.load(Ordering::Acquire);
     if raw == 0 {
         unsafe {
             let mut hmodule = HMODULE::default();
@@ -72,7 +147,7 @@ pub(crate) fn dll_path() -> Option<std::path::PathBuf> {
                 && !hmodule.is_invalid()
             {
                 raw = hmodule.0 as usize;
-                DLL_MODULE.store(raw, Ordering::SeqCst);
+                DLL_MODULE.store(raw, Ordering::Release);
             }
         }
     }
@@ -94,8 +169,8 @@ pub(crate) fn dll_path() -> Option<std::path::PathBuf> {
 fn write_log(err: impl std::fmt::Display) {
     #[cfg(feature = "config")]
     {
-        if crate::config::get_config().log {
-            if let Some(path) = crate::config::log_path()
+        if crate::config::get_config().log
+            && let Some(path) = crate::config::log_path()
                 && let Ok(mut file) = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -104,7 +179,6 @@ fn write_log(err: impl std::fmt::Display) {
                 let _ = writeln!(file, "[{}] {}", timestamp(), err);
                 return;
             }
-        }
     }
     // Fallback: always write to err.txt so we don't lose error visibility.
     if let Some(path) = dll_dir().map(|d| d.join("err.txt"))
@@ -117,31 +191,9 @@ fn write_log(err: impl std::fmt::Display) {
     }
 }
 
-/// Compute a UTC timestamp string without external dependencies.
-/// Uses Howard Hinnant's civil_from_days algorithm.
+/// Compute a UTC timestamp string for log entries.
 fn timestamp() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let z = (secs / 86400) as i64 + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-
-    let tod = secs % 86400;
-    let h = tod / 3600;
-    let min = (tod % 3600) / 60;
-    let s = tod % 60;
-    format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02}:{s:02} UTC")
+    Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string()
 }
 
 // =============================================================================
@@ -350,17 +402,17 @@ unsafe extern "system" fn cf_query_interface(
 unsafe extern "system" fn cf_add_ref(this: *mut c_void) -> u32 {
     unsafe {
         let cf = &*(this as *const ClassFactory);
-        cf.ref_count.fetch_add(1, Ordering::SeqCst) + 1
+        cf.ref_count.fetch_add(1, Ordering::Relaxed) + 1
     }
 }
 
 unsafe extern "system" fn cf_release(this: *mut c_void) -> u32 {
     unsafe {
         let cf = &*(this as *const ClassFactory);
-        let count = cf.ref_count.fetch_sub(1, Ordering::SeqCst) - 1;
+        let count = cf.ref_count.fetch_sub(1, Ordering::Relaxed) - 1;
         if count == 0 {
             drop(Box::from_raw(this as *mut ClassFactory));
-            DLL_REF_COUNT.fetch_sub(1, Ordering::SeqCst);
+            DLL_REF_COUNT.fetch_sub(1, Ordering::Relaxed);
         }
         count
     }
@@ -391,9 +443,9 @@ unsafe extern "system" fn cf_create_instance(
 
 unsafe extern "system" fn cf_lock_server(_this: *mut c_void, lock: i32) -> HRESULT {
     if lock != 0 {
-        DLL_REF_COUNT.fetch_add(1, Ordering::SeqCst);
+        DLL_REF_COUNT.fetch_add(1, Ordering::Relaxed);
     } else {
-        DLL_REF_COUNT.fetch_sub(1, Ordering::SeqCst);
+        DLL_REF_COUNT.fetch_sub(1, Ordering::Relaxed);
     }
     S_OK
 }
@@ -432,7 +484,7 @@ static CONTEXT_MENU_VTBL: IContextMenuVtbl = IContextMenuVtbl {
 
 impl ContextMenuHandler {
     fn new() -> Self {
-        DLL_REF_COUNT.fetch_add(1, Ordering::SeqCst);
+        DLL_REF_COUNT.fetch_add(1, Ordering::Relaxed);
         Self {
             vtbl_init: &SHELL_EXT_INIT_VTBL,
             vtbl_menu: &CONTEXT_MENU_VTBL,
@@ -483,17 +535,17 @@ unsafe extern "system" fn handler_query_interface(
 unsafe extern "system" fn handler_add_ref(this: *mut c_void) -> u32 {
     unsafe {
         let handler = &*(this as *const ContextMenuHandler);
-        handler.ref_count.fetch_add(1, Ordering::SeqCst) + 1
+        handler.ref_count.fetch_add(1, Ordering::Relaxed) + 1
     }
 }
 
 unsafe extern "system" fn handler_release(this: *mut c_void) -> u32 {
     unsafe {
         let handler = this as *mut ContextMenuHandler;
-        let count = (*handler).ref_count.fetch_sub(1, Ordering::SeqCst) - 1;
+        let count = (*handler).ref_count.fetch_sub(1, Ordering::Relaxed) - 1;
         if count == 0 {
             drop(Box::from_raw(handler));
-            DLL_REF_COUNT.fetch_sub(1, Ordering::SeqCst);
+            DLL_REF_COUNT.fetch_sub(1, Ordering::Relaxed);
         }
         count
     }
@@ -535,6 +587,11 @@ unsafe extern "system" fn handler_initialize(
     _hkey_prog_id: isize,
 ) -> HRESULT {
     unsafe {
+        // Install the inline hook on TrackPopupMenu once (first call).
+        // This intercepts ALL subsequent TrackPopupMenu calls in the
+        // explorer process, preventing the system menu from appearing.
+        install_cbt_menu_blocker();
+
         let handler = &*(this as *const ContextMenuHandler);
         let Ok(mut info) = handler.info.lock() else {
             return E_FAIL;
@@ -593,14 +650,17 @@ unsafe fn extract_selected_files(p_data_obj: *mut c_void, info: &mut ContextMenu
     unsafe {
         // IDataObject vtable: [QI, AddRef, Release, GetData, ...]
         // GetData is index 3
-        let vtbl_ptr = *(p_data_obj as *const *const usize);
+        let vtbl = *(p_data_obj as *const *const usize);
+        if vtbl.is_null() {
+            return;
+        }
 
         type GetDataFn = unsafe extern "system" fn(
             *mut c_void,
             *const RawFormatEtc,
             *mut RawStgMedium,
         ) -> HRESULT;
-        let get_data: GetDataFn = std::mem::transmute(*(vtbl_ptr.add(3)));
+        let get_data: GetDataFn = std::mem::transmute(*(vtbl.add(3)));
 
         let fmt = RawFormatEtc {
             cf_format: 15, // CF_HDROP
@@ -617,6 +677,8 @@ unsafe fn extract_selected_files(p_data_obj: *mut c_void, info: &mut ContextMenu
 
         let hr = get_data(p_data_obj, &fmt, &mut medium);
         if hr != S_OK || medium.data.is_null() {
+            // Release STGMEDIUM even on failure (it may hold partial data).
+            release_stg_medium(&mut medium);
             return;
         }
 
@@ -634,12 +696,20 @@ unsafe fn extract_selected_files(p_data_obj: *mut c_void, info: &mut ContextMenu
             }
         }
 
-        // Release the STGMEDIUM by calling ReleaseStgMedium via ole32
-        // For TYMED_HGLOBAL with null pUnkForRelease, GlobalFree is sufficient
-        if medium.punk_for_release.is_null() && medium.tymed == 1 {
-            // TYMED_HGLOBAL - we don't own it if pUnkForRelease is null, do nothing
-            // The shell manages the memory
-        }
+        // Release the STGMEDIUM — the shell allocated it, we must free it.
+        release_stg_medium(&mut medium);
+    }
+}
+
+/// Call ole32!ReleaseStgMedium to free resources held by an STGMEDIUM.
+unsafe fn release_stg_medium(medium: &mut RawStgMedium) {
+    // Declare the external function from ole32.dll.
+    #[link(name = "ole32")]
+    unsafe extern "system" {
+        fn ReleaseStgMedium(pmedium: *mut RawStgMedium);
+    }
+    unsafe {
+        ReleaseStgMedium(medium);
     }
 }
 
@@ -683,45 +753,24 @@ unsafe extern "system" fn handler_query_context_menu(
             }
         }
 
-        #[cfg(feature = "config")]
-        if crate::config::get_config().block_win11_menu {
-            if let Ok(info) = handler.info.lock() {
-                if info.window_handle != 0 {
-                    let hwnd_val = info.window_handle;
-                    
-                    // Prevent DLL from unloading while thread is active
-                    crate::DLL_REF_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        unsafe {
-                            let hwnd_orig = HWND(hwnd_val as *mut _);
-                            let thread_id = GetWindowThreadProcessId(hwnd_orig, None);
-                            
-                            let mut gui_info = GUITHREADINFO {
-                                cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
-                                ..Default::default()
-                            };
-                            
-                            // Query the GUI state of the specific Explorer thread
-                            if GetGUIThreadInfo(thread_id, &mut gui_info).is_ok() {
-                                if !gui_info.hwndMenuOwner.0.is_null() {
-                                    // Found the precise window owning the menu, send WM_CANCELMODE
-                                    let _ = PostMessageW(Some(gui_info.hwndMenuOwner), WM_CANCELMODE, WPARAM(0), LPARAM(0));
-                                } else {
-                                    // Fallback to original window
-                                    let _ = PostMessageW(Some(hwnd_orig), WM_CANCELMODE, WPARAM(0), LPARAM(0));
-                                }
-                            } else {
-                                let _ = PostMessageW(Some(hwnd_orig), WM_CANCELMODE, WPARAM(0), LPARAM(0));
-                            }
-                        }
-                        
-                        // Release DLL lock
-                        crate::DLL_REF_COUNT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                    });
-                }
-            }
+        // -----------------------------------------------------------------
+        // Block the system context menu from appearing.
+        //
+        // The inline hook on TrackPopupMenu (installed during
+        // IShellExtInit::Initialize) intercepts the API call before any
+        // menu window is created, returning FALSE immediately.
+        // So the menu never appears — no flash, no timing issues.
+        //
+        // We still return E_FAIL to tell the shell we contributed nothing.
+        // -----------------------------------------------------------------
+        let should_block = {
+            #[cfg(feature = "config")]
+            { crate::config::get_config().block_win11_menu }
+            #[cfg(not(feature = "config"))]
+            { true }
+        };
+
+        if should_block {
             return E_FAIL;
         }
 
@@ -756,7 +805,7 @@ unsafe extern "system" fn DllMain(hinstance: HMODULE, reason: u32, _reserved: *m
     // BOOL = i32; TRUE = 1
     unsafe {
         if reason == DLL_PROCESS_ATTACH {
-            DLL_MODULE.store(hinstance.0 as usize, Ordering::SeqCst);
+            DLL_MODULE.store(hinstance.0 as usize, Ordering::Release);
             let _ = DisableThreadLibraryCalls(hinstance);
         }
         1 // TRUE
@@ -783,7 +832,7 @@ unsafe extern "system" fn DllGetClassObject(
             vtbl: &CLASS_FACTORY_VTBL,
             ref_count: AtomicU32::new(1),
         });
-        DLL_REF_COUNT.fetch_add(1, Ordering::SeqCst);
+        DLL_REF_COUNT.fetch_add(1, Ordering::Relaxed);
 
         let ptr = Box::into_raw(factory) as *mut c_void;
         let hr = cf_query_interface(ptr, riid, ppv);
@@ -795,7 +844,7 @@ unsafe extern "system" fn DllGetClassObject(
 
 #[unsafe(no_mangle)]
 extern "system" fn DllCanUnloadNow() -> HRESULT {
-    if DLL_REF_COUNT.load(Ordering::SeqCst) == 0 {
+    if DLL_REF_COUNT.load(Ordering::Relaxed) == 0 {
         S_OK
     } else {
         S_FALSE
