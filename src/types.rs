@@ -6,14 +6,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Event {
-    LeftClickSelect { flags: u32 },
-    RightClickMenu { flags: u32 },
-    ShiftSelect { flags: u32 },
+    Click { flags: u32 },
+    Menu { flags: u32 },
+    Shift { flags: u32 },
 }
 
 impl Default for Event {
     fn default() -> Self {
-        Event::RightClickMenu { flags: 0 }
+        Event::Menu { flags: 0 }
     }
 }
 
@@ -21,9 +21,9 @@ impl Event {
     /// Return the raw flags bitmask.
     pub fn flags(&self) -> u32 {
         match self {
-            Event::LeftClickSelect { flags } => *flags,
-            Event::RightClickMenu { flags } => *flags,
-            Event::ShiftSelect { flags } => *flags,
+            Event::Click { flags } => *flags,
+            Event::Menu { flags } => *flags,
+            Event::Shift { flags } => *flags,
         }
     }
 
@@ -86,9 +86,9 @@ impl Event {
 impl std::fmt::Display for Event {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
-            Event::LeftClickSelect { .. } => "LeftClickSelect",
-            Event::RightClickMenu { .. } => "RightClickMenu",
-            Event::ShiftSelect { .. } => "ShiftSelect",
+            Event::Click { .. } => "Click",
+            Event::Menu { .. } => "Menu",
+            Event::Shift { .. } => "Shift",
         };
         write!(f, "{} ({} - {})", name, self.flags(), self.flags_str())
     }
@@ -99,33 +99,32 @@ impl std::fmt::Display for Event {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ContextMenuInfo {
     pub cid: String,
-    pub timestamp: String,
-    pub cursor_x: i32,
-    pub cursor_y: i32,
-    pub folder_path: String,
-    pub selected_files: Vec<String>,
-    pub file_count: u32,
-    pub is_background: bool,
-    pub window_handle: usize,
-    pub window_class: String,
-    pub process_id: u32,
+    pub ts: String,
+    pub x: i32,
+    pub y: i32,
+    pub dir: String,
+    pub files: Vec<String>,
+    pub bg: bool,
+    pub hwnd: usize,
+    pub class: String,
+    pub pid: u32,
     pub event: Event,
 }
 
 impl std::fmt::Display for ContextMenuInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "[{}]", self.timestamp)?;
-        writeln!(f, "Position: ({}, {})", self.cursor_x, self.cursor_y)?;
-        writeln!(f, "Directory: {}", self.folder_path)?;
-        writeln!(f, "Background: {}", self.is_background)?;
-        writeln!(f, "File Count: {}", self.file_count)?;
-        writeln!(f, "Window: 0x{:X}", self.window_handle)?;
-        writeln!(f, "Window Class: {}", self.window_class)?;
-        writeln!(f, "Process ID: {}", self.process_id)?;
+        writeln!(f, "[{}]", self.ts)?;
+        writeln!(f, "Position: ({}, {})", self.x, self.y)?;
+        writeln!(f, "Directory: {}", self.dir)?;
+        writeln!(f, "Background: {}", self.bg)?;
+        writeln!(f, "File Count: {}", self.files.len())?;
+        writeln!(f, "Window: 0x{:X}", self.hwnd)?;
+        writeln!(f, "Window Class: {}", self.class)?;
+        writeln!(f, "Process ID: {}", self.pid)?;
         writeln!(f, "Event: {}", self.event)?;
-        if !self.selected_files.is_empty() {
+        if !self.files.is_empty() {
             writeln!(f, "Selected Files:")?;
-            for file in &self.selected_files {
+            for file in &self.files {
                 writeln!(f, "  - {file}")?;
             }
         }

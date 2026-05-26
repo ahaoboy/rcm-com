@@ -223,21 +223,21 @@ unsafe extern "system" fn handler_initialize(
         };
         *info = ContextMenuInfo::default();
 
-        info.timestamp = helpers::timestamp();
-        info.process_id = std::process::id();
+        info.ts = helpers::timestamp();
+        info.pid = std::process::id();
 
         // Cursor position
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
-        info.cursor_x = pt.x;
-        info.cursor_y = pt.y;
+        info.x = pt.x;
+        info.y = pt.y;
 
         // Folder path from PIDL
         if !pidl_folder.is_null() {
             let mut buf = [0u16; 260];
             if SHGetPathFromIDListW(pidl_folder as *const _, &mut buf).as_bool() {
                 let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-                info.folder_path = String::from_utf16_lossy(&buf[..len]);
+                info.dir = String::from_utf16_lossy(&buf[..len]);
             }
         }
 
@@ -248,21 +248,21 @@ unsafe extern "system" fn handler_initialize(
 
         // Context menus invoked on files (e.g. from HKCR\*) often pass a NULL
         // pidlFolder. Recover the directory from the first selected file's parent.
-        if info.folder_path.is_empty() && !info.selected_files.is_empty()
-            && let Some(first_file) = info.selected_files.first()
+        if info.dir.is_empty() && !info.files.is_empty()
+            && let Some(first_file) = info.files.first()
                 && let Some(parent) = std::path::Path::new(first_file).parent() {
-                    info.folder_path = parent.to_string_lossy().into_owned();
+                    info.dir = parent.to_string_lossy().into_owned();
                 }
 
-        info.is_background = info.selected_files.is_empty() && !info.folder_path.is_empty();
+        info.bg = info.files.is_empty() && !info.dir.is_empty();
 
         // Window information
         let hwnd = GetForegroundWindow();
-        info.window_handle = hwnd.0 as usize;
+        info.hwnd = hwnd.0 as usize;
         let mut class_buf = [0u16; 256];
         let class_len = GetClassNameW(hwnd, &mut class_buf);
         if class_len > 0 {
-            info.window_class = String::from_utf16_lossy(&class_buf[..class_len as usize]);
+            info.class = String::from_utf16_lossy(&class_buf[..class_len as usize]);
         }
 
         S_OK
@@ -285,11 +285,11 @@ unsafe extern "system" fn handler_query_context_menu(
         let handler = &*handler_from_menu_ptr(this);
         if let Ok(mut info) = handler.info.lock() {
             if uflags & 0x00000001 != 0 {
-                info.event = Event::LeftClickSelect { flags: uflags };
+                info.event = Event::Click { flags: uflags };
             } else if uflags & 0x00000100 != 0 {
-                info.event = Event::ShiftSelect { flags: uflags };
+                info.event = Event::Shift { flags: uflags };
             } else {
-                info.event = Event::RightClickMenu { flags: uflags };
+                info.event = Event::Menu { flags: uflags };
             }
 
             // Send the info over the named pipe.
@@ -392,14 +392,13 @@ unsafe fn extract_selected_files(p_data_obj: *mut c_void, info: &mut ContextMenu
 
         let hdrop = HDROP(medium.data);
         let count = DragQueryFileW(hdrop, 0xFFFFFFFF, None);
-        info.file_count = count;
 
         for i in 0..count {
             let len = DragQueryFileW(hdrop, i, None);
             if len > 0 {
                 let mut buf = vec![0u16; (len + 1) as usize];
                 DragQueryFileW(hdrop, i, Some(&mut buf));
-                info.selected_files
+                info.files
                     .push(String::from_utf16_lossy(&buf[..len as usize]));
             }
         }
