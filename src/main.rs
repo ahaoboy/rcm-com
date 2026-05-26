@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use rcm_com::{PIPE_NAME, cmd, restart_explorer, server::listen, set_default_classic_menu, set_win11_menu_style  };
+use rcm_com::{PIPE_NAME, cmd, get_menu_style, is_default_classic, restart_explorer, server::listen, set_default_classic_menu, set_win11_menu_style};
 
 #[derive(Parser)]
 #[command(name = "rcm")]
@@ -20,10 +20,10 @@ enum Commands {
     Start,
     /// Show current registration status and configuration
     Status,
-    /// Switch right-click menu between Windows 11 and Windows 10 classic style
+    /// Switch right-click menu or show current style
     Menu {
         #[command(subcommand)]
-        action: MenuAction,
+        action: Option<MenuAction>,
     },
     /// Restart Windows Explorer (stop, wait 5s, start)
     RestartExplorer,
@@ -71,9 +71,14 @@ async fn main() {
             println!("{s}");
         }),
         Commands::Menu { action } => match action {
-            MenuAction::Win10 => set_win11_menu_style(true),
-            MenuAction::Win11 => set_win11_menu_style(false),
-            MenuAction::Default { classic } => set_default_classic_menu(classic),
+            Some(MenuAction::Win10) => set_win11_menu_style(true),
+            Some(MenuAction::Win11) => set_win11_menu_style(false),
+            Some(MenuAction::Default { classic }) => set_default_classic_menu(classic),
+            None => {
+                println!("Menu style:     {}", get_menu_style());
+                println!("Default classic: {}", is_default_classic());
+                Ok(())
+            }
         },
         Commands::RestartExplorer => restart_explorer(),
     };

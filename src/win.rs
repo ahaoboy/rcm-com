@@ -167,11 +167,23 @@ pub fn restart_explorer() -> Result<()> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-/// Check the current context menu style.
+/// Get the current right-click context menu style.
 ///
-/// Returns `true` if the Windows 10 classic menu is currently active,
-/// `false` if the Windows 11 compact menu is active.
-pub fn is_win10_menu_active() -> bool {
+/// Returns `"Win10"` if the classic expanded menu is active,
+/// or `"Win11"` if the default compact menu is active.
+pub fn get_menu_style() -> &'static str {
+    if is_default_classic() {
+        "Win10"
+    } else {
+        "Win11"
+    }
+}
+
+/// Check whether the classic (Windows 10) context menu is set as the default.
+///
+/// Returns `true` if the classic expanded menu is the current default,
+/// `false` if the Windows 11 compact menu is the default.
+pub fn is_default_classic() -> bool {
     use windows::Win32::System::Registry::*;
     use windows::core::PCWSTR;
 
