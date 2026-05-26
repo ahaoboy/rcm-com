@@ -1,18 +1,21 @@
- #![allow(non_snake_case)]
+#![allow(non_snake_case)]
 
 // ── public modules ───────────────────────────────────────────────────────
 pub mod cmd;
+#[cfg(feature = "config")]
+pub mod config;
 pub mod consts;
 pub mod error;
 pub mod server;
-#[cfg(feature = "config")]
-pub mod config;
+mod win;
+
+pub use win::*;
 
 // ── private modules ──────────────────────────────────────────────────────
-pub(crate) mod types;
+pub(crate) mod com;
 pub(crate) mod helpers;
 pub(crate) mod hooks;
-pub(crate) mod com;
+pub(crate) mod types;
 
 // ── public re-exports ────────────────────────────────────────────────────
 pub use consts::PIPE_NAME;
@@ -26,9 +29,9 @@ use windows::Win32::System::LibraryLoader::DisableThreadLibraryCalls;
 use windows::Win32::System::SystemServices::*;
 use windows::core::{GUID, HRESULT};
 
+use crate::com::ContextMenuHandler;
 use crate::consts::*;
 use crate::helpers::DLL_MODULE;
-use crate::com::ContextMenuHandler;
 
 // =============================================================================
 // ClassFactory

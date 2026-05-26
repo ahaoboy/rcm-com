@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use rcm_com::{PIPE_NAME, cmd, server::listen};
+use rcm_com::{PIPE_NAME, cmd, restart_explorer, server::listen, set_default_classic_menu, set_win11_menu_style  };
 
 #[derive(Parser)]
 #[command(name = "rcm")]
@@ -20,6 +20,27 @@ enum Commands {
     Start,
     /// Show current registration status and configuration
     Status,
+    /// Switch right-click menu between Windows 11 and Windows 10 classic style
+    Menu {
+        #[command(subcommand)]
+        action: MenuAction,
+    },
+    /// Restart Windows Explorer (stop, wait 5s, start)
+    RestartExplorer,
+}
+
+#[derive(Subcommand)]
+enum MenuAction {
+    /// Use Windows 10 classic expanded context menu
+    Win10,
+    /// Use Windows 11 default compact context menu
+    Win11,
+    /// Set whether the classic menu is the default
+    Default {
+        /// Whether to use classic (Win10) style by default
+        #[arg(short, long, default_value = "true")]
+        classic: bool,
+    },
 }
 
 #[tokio::main]
@@ -49,6 +70,12 @@ async fn main() {
         Commands::Status => cmd::status().map(|s| {
             println!("{s}");
         }),
+        Commands::Menu { action } => match action {
+            MenuAction::Win10 => set_win11_menu_style(true),
+            MenuAction::Win11 => set_win11_menu_style(false),
+            MenuAction::Default { classic } => set_default_classic_menu(classic),
+        },
+        Commands::RestartExplorer => restart_explorer(),
     };
 
     if let Err(e) = result {
