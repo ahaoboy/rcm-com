@@ -7,6 +7,9 @@
 A Rust-based Windows Shell Extension that captures right-click context menu
 information and sends it to a listening process via a named pipe.
 
+Shortcut (`.lnk`) files are captured as the shortcut file path itself instead
+of the linked target path.
+
 ---
 
 ## Install

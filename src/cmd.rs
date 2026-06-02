@@ -129,6 +129,7 @@ fn get_reg_value(key: HKEY, name: Option<&str>) -> Result<String> {
 fn get_handler_paths() -> Vec<String> {
     vec![
         format!("*\\shellex\\ContextMenuHandlers\\{HANDLER_NAME}"),
+        format!("lnkfile\\shellex\\ContextMenuHandlers\\{HANDLER_NAME}"),
         format!("Directory\\shellex\\ContextMenuHandlers\\{HANDLER_NAME}"),
         format!("Directory\\Background\\shellex\\ContextMenuHandlers\\{HANDLER_NAME}"),
     ]
@@ -217,6 +218,7 @@ pub struct Status {
     pub inproc_path: Option<String>,
     pub threading_model: Option<String>,
     pub handler_star_ok: bool,
+    pub handler_lnkfile_ok: bool,
     pub handler_directory_ok: bool,
     pub handler_background_ok: bool,
     pub is_approved: bool,
@@ -231,6 +233,7 @@ impl Status {
             && self.clsid_exists
             && self.inproc_path.is_some()
             && self.handler_star_ok
+            && self.handler_lnkfile_ok
             && self.handler_directory_ok
             && self.handler_background_ok
             && self.is_approved
@@ -279,8 +282,9 @@ impl Display for Status {
 
         let paths = get_handler_paths();
         print_handler(f, self.handler_star_ok, &paths[0])?;
-        print_handler(f, self.handler_directory_ok, &paths[1])?;
-        print_handler(f, self.handler_background_ok, &paths[2])?;
+        print_handler(f, self.handler_lnkfile_ok, &paths[1])?;
+        print_handler(f, self.handler_directory_ok, &paths[2])?;
+        print_handler(f, self.handler_background_ok, &paths[3])?;
 
         if self.is_approved {
             writeln!(f, "  ✅ Approved")?;
@@ -325,6 +329,7 @@ pub fn status() -> Result<Status> {
         inproc_path: None,
         threading_model: None,
         handler_star_ok: false,
+        handler_lnkfile_ok: false,
         handler_directory_ok: false,
         handler_background_ok: false,
         is_approved: false,
@@ -371,8 +376,9 @@ pub fn status() -> Result<Status> {
     };
 
     status.handler_star_ok = check_handler(&handler_paths[0]);
-    status.handler_directory_ok = check_handler(&handler_paths[1]);
-    status.handler_background_ok = check_handler(&handler_paths[2]);
+    status.handler_lnkfile_ok = check_handler(&handler_paths[1]);
+    status.handler_directory_ok = check_handler(&handler_paths[2]);
+    status.handler_background_ok = check_handler(&handler_paths[3]);
 
     // Approved
     let approved_path = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Shell Extensions\\Approved";
