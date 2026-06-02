@@ -22,6 +22,10 @@ pub enum RcmError {
 
     #[error("Windows Error: {0}")]
     Windows(#[from] windows::core::Error),
+
+    #[cfg(feature = "cli")]
+    #[error("rcm-reg Error: {0}")]
+    RcmReg(#[from] rcm_reg::RcmError),
 }
 
 pub type Result<T> = std::result::Result<T, RcmError>;

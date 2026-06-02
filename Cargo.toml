@@ -9,7 +9,8 @@ homepage = "https://github.com/ahaoboy/rcm-com"
 authors = ["ahaoboy"]
 
 [features]
-default = ["config"]
+default = ["cli", "config"]
+cli = ["dep:rcm-reg"]
 config = []
 
 [lib]
@@ -21,24 +22,30 @@ chrono = "0.4"
 is-admin = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util"] }
+tokio = { version = "1", features = [
+  "net",
+  "rt-multi-thread",
+  "macros",
+  "io-util",
+] }
 thiserror = "2"
 # fix 0.61
 windows = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_System_Com",
-    "Win32_System_LibraryLoader",
-    "Win32_System_Memory",
-    "Win32_System_Ole",
-    "Win32_System_Registry",
-    "Win32_System_SystemServices",
-    "Win32_System_Threading",
-    "Win32_Storage_FileSystem",
-    "Win32_System_DataExchange",
-    "Win32_UI_Shell",
-    "Win32_UI_Shell_Common",
-    "Win32_UI_WindowsAndMessaging",
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_System_Ole",
+  "Win32_System_Registry",
+  "Win32_System_SystemServices",
+  "Win32_System_Threading",
+  "Win32_Storage_FileSystem",
+  "Win32_System_DataExchange",
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
+  "Win32_UI_WindowsAndMessaging",
 ] }
+rcm-reg = { git = "https://github.com/ahaoboy/rcm-reg", version = "0.1", optional = true }
 
 [[bin]]
 path = "src/main.rs"

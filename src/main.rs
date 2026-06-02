@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
-use rcm_com::{PIPE_NAME, cmd, get_menu_style, is_default_classic, restart_explorer, server::listen, set_default_classic_menu, set_win11_menu_style};
+use rcm_com::{PIPE_NAME, cmd, error::RcmError, server::listen};
+use rcm_reg::{MenuStyle, restart_explorer};
 
 #[derive(Parser)]
 #[command(name = "rcm")]
@@ -71,16 +72,24 @@ async fn main() {
             println!("{s}");
         }),
         Commands::Menu { action } => match action {
-            Some(MenuAction::Win10) => set_win11_menu_style(true),
-            Some(MenuAction::Win11) => set_win11_menu_style(false),
-            Some(MenuAction::Default { classic }) => set_default_classic_menu(classic),
+            Some(MenuAction::Win10) => MenuStyle::Classic.set().map_err(RcmError::from),
+            Some(MenuAction::Win11) => MenuStyle::Windows11.set().map_err(RcmError::from),
+            Some(MenuAction::Default { classic }) => if classic {
+                MenuStyle::Classic.set()
+            } else {
+                MenuStyle::Windows11.set()
+            }
+            .map_err(RcmError::from),
             None => {
-                println!("Menu style:     {}", get_menu_style());
-                println!("Default classic: {}", is_default_classic());
+                let style = MenuStyle::current();
+                println!("Menu style:     {style}");
+                println!("Default classic: {}", matches!(style, MenuStyle::Classic));
                 Ok(())
             }
         },
-        Commands::RestartExplorer => restart_explorer(),
+        Commands::RestartExplorer => {
+            restart_explorer(std::time::Duration::from_secs(5)).map_err(RcmError::from)
+        }
     };
 
     if let Err(e) = result {
