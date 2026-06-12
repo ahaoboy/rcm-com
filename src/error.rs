@@ -8,6 +8,9 @@ pub enum RcmError {
     #[error("Serialization Error: {0}")]
     Serialization(#[from] serde_json::Error),
 
+    #[error("UTF-8 Decoding Error: {0}")]
+    Utf8(#[from] std::string::FromUtf8Error),
+
     #[error("Registry Error: {0}")]
     Registry(String),
 
@@ -16,9 +19,6 @@ pub enum RcmError {
 
     #[error("Environment Error: {0}")]
     Environment(String),
-
-    #[error("UTF-8 Decoding Error: {0}")]
-    Utf8(#[from] std::string::FromUtf8Error),
 
     #[error("Windows Error: {0}")]
     Windows(#[from] windows::core::Error),

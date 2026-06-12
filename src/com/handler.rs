@@ -1,8 +1,9 @@
-//! COM shell extension handler — implements IShellExtInit and IContextMenu.
+//! ContextMenuHandler — implements IShellExtInit + IContextMenu.
 //!
-//! The `ContextMenuHandler` struct captures right-click context data from
-//! Explorer and sends it over a named pipe to the listening process. It also
-//! blocks the default Windows 11 context menu via a WH_CBT hook.
+//! Captures right-click context data from Explorer and sends it over a named
+//! pipe to the listening process. Always blocks the native context menu from
+//! appearing via a WH_CBT hook (Win10) and by returning E_FAIL from
+//! QueryContextMenu (Win11).
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -12,71 +13,23 @@ use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{GUID, HRESULT};
 
+use crate::com::dataobj::extract_selected_files;
+use crate::com::vtable::{IContextMenuVtbl, IShellExtInitVtbl, IUnknownVtbl};
 use crate::consts::*;
 use crate::helpers::{self, DLL_REF_COUNT};
 use crate::hooks::install_cbt_menu_blocker;
 use crate::types::{ContextMenuInfo, Event};
 
 // =============================================================================
-// Raw COM vtable definitions (C ABI compatible)
-// =============================================================================
-
-#[repr(C)]
-pub(crate) struct IUnknownVtbl {
-    pub(crate) QueryInterface:
-        unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
-    AddRef: unsafe extern "system" fn(*mut c_void) -> u32,
-    pub(crate) Release: unsafe extern "system" fn(*mut c_void) -> u32,
-}
-
-#[repr(C)]
-pub(crate) struct IShellExtInitVtbl {
-    pub(crate) base: IUnknownVtbl,
-    Initialize: unsafe extern "system" fn(
-        *mut c_void,   // this
-        *const c_void, // pidlFolder (PCIDLIST_ABSOLUTE)
-        *mut c_void,   // pDataObj (IDataObject*)
-        isize,         // hKeyProgID (HKEY)
-    ) -> HRESULT,
-}
-
-#[repr(C)]
-struct IContextMenuVtbl {
-    base: IUnknownVtbl,
-    QueryContextMenu: unsafe extern "system" fn(*mut c_void, isize, u32, u32, u32, u32) -> HRESULT,
-    InvokeCommand: unsafe extern "system" fn(*mut c_void, *const c_void) -> HRESULT,
-    GetCommandString:
-        unsafe extern "system" fn(*mut c_void, usize, u32, *const u32, *mut u8, u32) -> HRESULT,
-}
-
-/// Raw FORMATETC for IDataObject::GetData call.
-#[repr(C)]
-struct RawFormatEtc {
-    cf_format: u16,
-    ptd: *mut c_void,
-    dw_aspect: u32,
-    lindex: i32,
-    tymed: u32,
-}
-
-/// Raw STGMEDIUM for IDataObject::GetData call.
-#[repr(C)]
-struct RawStgMedium {
-    tymed: u32,
-    data: *mut c_void, // union field (hGlobal for TYMED_HGLOBAL)
-    punk_for_release: *mut c_void,
-}
-
-// =============================================================================
-// ContextMenuHandler — implements IShellExtInit + IContextMenu
+// ContextMenuHandler struct
 // =============================================================================
 
 #[repr(C)]
 pub(crate) struct ContextMenuHandler {
     pub(crate) vtbl_init: *const IShellExtInitVtbl,
-    vtbl_menu: *const IContextMenuVtbl,
+    pub(crate) vtbl_menu: *const IContextMenuVtbl,
     ref_count: AtomicU32,
-    info: std::sync::Mutex<ContextMenuInfo>,
+    pub(crate) info: std::sync::Mutex<ContextMenuInfo>,
 }
 
 static SHELL_EXT_INIT_VTBL: IShellExtInitVtbl = IShellExtInitVtbl {
@@ -112,12 +65,12 @@ impl ContextMenuHandler {
 }
 
 // =============================================================================
-// Pointer arithmetic helpers
+// Pointer arithmetic helper
 // =============================================================================
 
 /// Recover `ContextMenuHandler*` from an `IContextMenu` interface pointer.
 /// `vtbl_menu` is the second pointer field in the struct (after `vtbl_init`).
-unsafe fn handler_from_menu_ptr(this: *mut c_void) -> *mut ContextMenuHandler {
+pub(crate) unsafe fn handler_from_menu_ptr(this: *mut c_void) -> *mut ContextMenuHandler {
     unsafe {
         (this as *mut u8).sub(std::mem::offset_of!(ContextMenuHandler, vtbl_menu))
             as *mut ContextMenuHandler
@@ -214,7 +167,8 @@ unsafe extern "system" fn handler_initialize(
     _hkey_prog_id: isize,
 ) -> HRESULT {
     unsafe {
-        // Install the CBT hook on first call to block the system menu.
+        // Always install the CBT hook to block native context menu windows.
+        // This works for both Win10 (TrackPopupMenu) and Win11 (new menu).
         install_cbt_menu_blocker();
 
         let handler = &*(this as *const ContextMenuHandler);
@@ -284,6 +238,7 @@ unsafe extern "system" fn handler_query_context_menu(
     unsafe {
         let handler = &*handler_from_menu_ptr(this);
         if let Ok(mut info) = handler.info.lock() {
+            // Determine event type from flags
             if uflags & 0x00000001 != 0 {
                 info.event = Event::Click { flags: uflags };
             } else if uflags & 0x00000100 != 0 {
@@ -292,8 +247,8 @@ unsafe extern "system" fn handler_query_context_menu(
                 info.event = Event::Menu { flags: uflags };
             }
 
-            // Send the info over the named pipe.
-            let execute_result = (|| -> crate::error::Result<()> {
+            // Send the info over the named pipe to the listening process.
+            let send_result = (|| -> crate::error::Result<()> {
                 let json_str = serde_json::to_string(&*info)?;
                 let mut pipe = std::fs::OpenOptions::new()
                     .write(true)
@@ -302,31 +257,16 @@ unsafe extern "system" fn handler_query_context_menu(
                 Ok(())
             })();
 
-            if let Err(err) = execute_result {
+            if let Err(err) = send_result {
                 helpers::write_log(err);
             }
         }
 
-        // Block the system context menu from appearing.
+        // Always block the native context menu — both Win10 and Win11.
         // The CBT hook (installed during IShellExtInit::Initialize) intercepts
-        // TrackPopupMenu before any menu window is created.
-        // We also return E_FAIL to tell the shell we contributed nothing.
-        let should_block = {
-            #[cfg(feature = "config")]
-            {
-                crate::config::get_config().block_win11_menu
-            }
-            #[cfg(not(feature = "config"))]
-            {
-                true
-            }
-        };
-
-        if should_block {
-            return E_FAIL;
-        }
-
-        HRESULT(0) // 0 items added
+        // TrackPopupMenu before any menu window is created. Returning E_FAIL
+        // tells the shell we contributed no items.
+        E_FAIL
     }
 }
 
@@ -346,75 +286,4 @@ unsafe extern "system" fn handler_get_command_string(
     _cch_max: u32,
 ) -> HRESULT {
     E_NOTIMPL
-}
-
-// =============================================================================
-// IDataObject helpers (raw vtable)
-// =============================================================================
-
-/// Extract selected file paths from IDataObject using CF_HDROP format.
-/// Uses raw COM vtable call to avoid windows crate feature issues with GetData.
-unsafe fn extract_selected_files(p_data_obj: *mut c_void, info: &mut ContextMenuInfo) {
-    unsafe {
-        // IDataObject vtable: [QI, AddRef, Release, GetData, ...]
-        // GetData is index 3
-        let vtbl = *(p_data_obj as *const *const usize);
-        if vtbl.is_null() {
-            return;
-        }
-
-        type GetDataFn = unsafe extern "system" fn(
-            *mut c_void,
-            *const RawFormatEtc,
-            *mut RawStgMedium,
-        ) -> HRESULT;
-        let get_data: GetDataFn = std::mem::transmute(*(vtbl.add(3)));
-
-        let fmt = RawFormatEtc {
-            cf_format: 15, // CF_HDROP
-            ptd: std::ptr::null_mut(),
-            dw_aspect: 1, // DVASPECT_CONTENT
-            lindex: -1,
-            tymed: 1, // TYMED_HGLOBAL
-        };
-        let mut medium = RawStgMedium {
-            tymed: 0,
-            data: std::ptr::null_mut(),
-            punk_for_release: std::ptr::null_mut(),
-        };
-
-        let hr = get_data(p_data_obj, &fmt, &mut medium);
-        if hr != S_OK || medium.data.is_null() {
-            // Release STGMEDIUM even on failure (it may hold partial data).
-            release_stg_medium(&mut medium);
-            return;
-        }
-
-        let hdrop = HDROP(medium.data);
-        let count = DragQueryFileW(hdrop, 0xFFFFFFFF, None);
-
-        for i in 0..count {
-            let len = DragQueryFileW(hdrop, i, None);
-            if len > 0 {
-                let mut buf = vec![0u16; (len + 1) as usize];
-                DragQueryFileW(hdrop, i, Some(&mut buf));
-                info.files
-                    .push(String::from_utf16_lossy(&buf[..len as usize]));
-            }
-        }
-
-        // Release the STGMEDIUM — the shell allocated it, we must free it.
-        release_stg_medium(&mut medium);
-    }
-}
-
-/// Call ole32!ReleaseStgMedium to free resources held by an STGMEDIUM.
-unsafe fn release_stg_medium(medium: &mut RawStgMedium) {
-    #[link(name = "ole32")]
-    unsafe extern "system" {
-        fn ReleaseStgMedium(pmedium: *mut RawStgMedium);
-    }
-    unsafe {
-        ReleaseStgMedium(medium);
-    }
 }

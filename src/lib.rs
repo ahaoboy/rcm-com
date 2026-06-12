@@ -2,8 +2,6 @@
 
 // ── public modules ───────────────────────────────────────────────────────
 pub mod cmd;
-#[cfg(feature = "config")]
-pub mod config;
 pub mod consts;
 pub mod error;
 pub mod server;
@@ -26,35 +24,15 @@ use windows::Win32::System::LibraryLoader::DisableThreadLibraryCalls;
 use windows::Win32::System::SystemServices::*;
 use windows::core::{GUID, HRESULT};
 
-use crate::com::ContextMenuHandler;
+use crate::com::handler::ContextMenuHandler;
+use crate::com::vtable::IClassFactoryVtbl;
+use crate::com::vtable::IUnknownVtbl;
 use crate::consts::*;
 use crate::helpers::DLL_MODULE;
 
 // =============================================================================
 // ClassFactory
 // =============================================================================
-
-static DLL_REF_COUNT: AtomicU32 = AtomicU32::new(0);
-
-#[repr(C)]
-struct IUnknownVtbl {
-    QueryInterface:
-        unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
-    AddRef: unsafe extern "system" fn(*mut c_void) -> u32,
-    Release: unsafe extern "system" fn(*mut c_void) -> u32,
-}
-
-#[repr(C)]
-struct IClassFactoryVtbl {
-    base: IUnknownVtbl,
-    CreateInstance: unsafe extern "system" fn(
-        *mut c_void,
-        *mut c_void,
-        *const GUID,
-        *mut *mut c_void,
-    ) -> HRESULT,
-    LockServer: unsafe extern "system" fn(*mut c_void, i32) -> HRESULT,
-}
 
 #[repr(C)]
 struct ClassFactory {
@@ -105,7 +83,7 @@ unsafe extern "system" fn cf_release(this: *mut c_void) -> u32 {
         let count = cf.ref_count.fetch_sub(1, Ordering::Relaxed) - 1;
         if count == 0 {
             drop(Box::from_raw(this as *mut ClassFactory));
-            DLL_REF_COUNT.fetch_sub(1, Ordering::Relaxed);
+            helpers::DLL_REF_COUNT.fetch_sub(1, Ordering::Relaxed);
         }
         count
     }
@@ -140,9 +118,9 @@ unsafe extern "system" fn cf_create_instance(
 
 unsafe extern "system" fn cf_lock_server(_this: *mut c_void, lock: i32) -> HRESULT {
     if lock != 0 {
-        DLL_REF_COUNT.fetch_add(1, Ordering::Relaxed);
+        helpers::DLL_REF_COUNT.fetch_add(1, Ordering::Relaxed);
     } else {
-        DLL_REF_COUNT.fetch_sub(1, Ordering::Relaxed);
+        helpers::DLL_REF_COUNT.fetch_sub(1, Ordering::Relaxed);
     }
     S_OK
 }
@@ -182,7 +160,7 @@ unsafe extern "system" fn DllGetClassObject(
             vtbl: &CLASS_FACTORY_VTBL,
             ref_count: AtomicU32::new(1),
         });
-        DLL_REF_COUNT.fetch_add(1, Ordering::Relaxed);
+        helpers::DLL_REF_COUNT.fetch_add(1, Ordering::Relaxed);
 
         let ptr = Box::into_raw(factory) as *mut c_void;
         let hr = cf_query_interface(ptr, riid, ppv);
@@ -194,7 +172,7 @@ unsafe extern "system" fn DllGetClassObject(
 
 #[unsafe(no_mangle)]
 extern "system" fn DllCanUnloadNow() -> HRESULT {
-    if DLL_REF_COUNT.load(Ordering::Relaxed) == 0 {
+    if helpers::DLL_REF_COUNT.load(Ordering::Relaxed) == 0 {
         S_OK
     } else {
         S_FALSE

@@ -45,6 +45,7 @@ pub(crate) fn dll_dir() -> Option<std::path::PathBuf> {
 }
 
 /// Return the full path to the DLL file itself.
+#[allow(dead_code)]
 pub(crate) fn dll_path() -> Option<std::path::PathBuf> {
     let mut raw = DLL_MODULE.load(Ordering::Acquire);
     if raw == 0 {
@@ -76,24 +77,8 @@ pub(crate) fn dll_path() -> Option<std::path::PathBuf> {
 
 /// Write a diagnostic log entry.
 ///
-/// When the `config` feature is active and `config.log` is enabled, the entry
-/// is appended to `{dll_stem}.log`. Otherwise it is written to `err.txt` as a
-/// fallback so errors are never silently lost.
+/// Always writes to `err.txt` as a fallback so errors are never silently lost.
 pub(crate) fn write_log(err: impl std::fmt::Display) {
-    #[cfg(feature = "config")]
-    {
-        if crate::config::get_config().log
-            && let Some(path) = crate::config::log_path()
-                && let Ok(mut file) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                {
-                    let _ = writeln!(file, "[{}] {}", timestamp(), err);
-                    return;
-                }
-    }
-    // Fallback: always write to err.txt so we don't lose error visibility.
     if let Some(path) = dll_dir().map(|d| d.join("err.txt"))
         && let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)

@@ -222,9 +222,6 @@ pub struct Status {
     pub handler_directory_ok: bool,
     pub handler_background_ok: bool,
     pub is_approved: bool,
-    pub config_path: Option<PathBuf>,
-    pub config_log_enabled: bool,
-    pub config_block_win11_menu: bool,
 }
 
 impl Status {
@@ -293,21 +290,6 @@ impl Display for Status {
         }
 
         writeln!(f)?;
-        writeln!(f, "Config:")?;
-        if let Some(ref cfg_path) = self.config_path {
-            if cfg_path.exists() {
-                writeln!(f, "  ✅ Config file: {}", cfg_path.display())?;
-                writeln!(f, "     log:              {}", self.config_log_enabled)?;
-                writeln!(f, "     block_win11_menu: {}", self.config_block_win11_menu)?;
-            } else {
-                writeln!(f, "  ⚠️  Config file not found: {}", cfg_path.display())?;
-                writeln!(f, "     (defaults: log=false, block_win11_menu=false)")?;
-            }
-        } else {
-            writeln!(f, "  ⚠️  Cannot determine config file path (DLL location unknown)")?;
-        }
-
-        writeln!(f)?;
         if self.is_valid() {
             writeln!(f, "Overall Status: ✅ All items are valid.")?;
         } else {
@@ -333,19 +315,7 @@ pub fn status() -> Result<Status> {
         handler_directory_ok: false,
         handler_background_ok: false,
         is_approved: false,
-        config_path: None,
-        config_log_enabled: false,
-        config_block_win11_menu: false,
     };
-
-    // Config file path & values
-    #[cfg(feature = "config")]
-    {
-        status.config_path = crate::config::config_path();
-        let cfg = crate::config::get_config();
-        status.config_log_enabled = cfg.log;
-        status.config_block_win11_menu = cfg.block_win11_menu;
-    }
 
     // Registry: CLSID
     let clsid_path = format!("CLSID\\{CLSID_STR}");
