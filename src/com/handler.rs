@@ -120,6 +120,12 @@ unsafe extern "system" fn handler_release(this: *mut c_void) -> u32 {
         let handler = this as *mut ContextMenuHandler;
         let count = (*handler).ref_count.fetch_sub(1, Ordering::Relaxed) - 1;
         if count == 0 {
+            // NOTE: we deliberately do NOT uninstall the CBT hook here.
+            // TrackPopupMenu may be called by Explorer *after* this Release,
+            // so the hook must survive the handler's lifetime.
+            // The hook is replaced (old uninstalled, new installed) on the
+            // next Initialize call, and cleaned up by the OS when the
+            // thread/process exits.
             drop(Box::from_raw(handler));
             DLL_REF_COUNT.fetch_sub(1, Ordering::Relaxed);
         }
@@ -202,11 +208,13 @@ unsafe extern "system" fn handler_initialize(
 
         // Context menus invoked on files (e.g. from HKCR\*) often pass a NULL
         // pidlFolder. Recover the directory from the first selected file's parent.
-        if info.dir.is_empty() && !info.files.is_empty()
+        if info.dir.is_empty()
+            && !info.files.is_empty()
             && let Some(first_file) = info.files.first()
-                && let Some(parent) = std::path::Path::new(first_file).parent() {
-                    info.dir = parent.to_string_lossy().into_owned();
-                }
+            && let Some(parent) = std::path::Path::new(first_file).parent()
+        {
+            info.dir = parent.to_string_lossy().into_owned();
+        }
 
         info.bg = info.files.is_empty() && !info.dir.is_empty();
 
