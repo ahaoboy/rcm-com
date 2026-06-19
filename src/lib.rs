@@ -172,7 +172,9 @@ unsafe extern "system" fn DllGetClassObject(
 
 #[unsafe(no_mangle)]
 extern "system" fn DllCanUnloadNow() -> HRESULT {
-    if helpers::DLL_REF_COUNT.load(Ordering::Relaxed) == 0 {
+    if helpers::DLL_REF_COUNT.load(Ordering::Relaxed) == 0
+        && !hooks::has_active_cbt_hooks()
+    {
         S_OK
     } else {
         S_FALSE

@@ -5,15 +5,16 @@
 //!
 //! ## Lifecycle (critical — do not change without understanding)
 //!
-//! The hook is installed on the first `Initialize` call and remains active
-//! **across handler lifecycles**. It is deliberately NOT uninstalled in
-//! `handler_release` because `TrackPopupMenu` may be called by Explorer
-//! *after* the handler has been released. Instead, each new `Initialize`
-//! call atomically swaps out the old hook for a fresh one. The OS
-//! automatically cleans up the last hook when the installing thread exits.
+//! The hook is thread-local because `WH_CBT` hooks are installed per Explorer
+//! thread. It is deliberately NOT uninstalled in `handler_release` because
+//! `TrackPopupMenu` may be called by Explorer *after* the handler has been
+//! released. Instead, each new `Initialize` call refreshes the hook for the
+//! current thread only. The OS automatically cleans up hooks when their
+//! installing threads exit.
 
+use std::cell::Cell;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -21,10 +22,12 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::helpers::DLL_MODULE;
 
-/// Handle of the active WH_CBT hook (0 when not installed).
-/// Atomic to prevent data races between the hook callback and the
-/// installer running on different COM apartment threads.
-static CBT_HOOK_HANDLE: AtomicIsize = AtomicIsize::new(0);
+static ACTIVE_CBT_HOOK_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// Handle of the active WH_CBT hook for this Explorer thread.
+    static CBT_HOOK_HANDLE: Cell<isize> = const { Cell::new(0) };
+}
 
 /// CBT hook procedure — called before windows are created on our thread.
 ///
@@ -54,13 +57,15 @@ unsafe extern "system" fn cbt_hook_proc(code: i32, _wparam: WPARAM, lparam: LPAR
     unsafe { CallNextHookEx(None, code, _wparam, lparam) }
 }
 
-/// Install a thread-local WH_CBT hook.  Atomically replaces any previous hook
-/// (old one is uninstalled, new one installed) so only one is active at a time.
+/// Install a WH_CBT hook for the current Explorer thread.
+///
+/// A process-global hook handle is incorrect here: `WH_CBT` is bound to the
+/// thread id passed to `SetWindowsHookExW`. Explorer can create context menus
+/// on different COM apartment threads over time, so each thread needs its own
+/// hook handle. Otherwise one thread can accidentally uninstall another
+/// thread's hook and native menus start leaking through intermittently.
 pub(crate) fn install_cbt_menu_blocker() {
     unsafe {
-        // Uninstall any previous hook first (safety: clean stale hooks).
-        uninstall_cbt_menu_blocker();
-
         let hinstance = HINSTANCE(DLL_MODULE.load(Ordering::Acquire) as *mut c_void);
         let hook = SetWindowsHookExW(
             WH_CBT,
@@ -69,18 +74,25 @@ pub(crate) fn install_cbt_menu_blocker() {
             GetCurrentThreadId(),
         );
         if let Ok(hook) = hook {
-            CBT_HOOK_HANDLE.store(hook.0 as isize, Ordering::Release);
+            CBT_HOOK_HANDLE.with(|cell| {
+                let old_hook = cell.replace(hook.0 as isize);
+                if old_hook == 0 {
+                    ACTIVE_CBT_HOOK_THREADS.fetch_add(1, Ordering::Relaxed);
+                }
+                if old_hook != 0 && old_hook != hook.0 as isize {
+                    unhook_raw(old_hook);
+                }
+            });
         }
     }
 }
 
-/// Uninstall the WH_CBT hook.  Called from `install_cbt_menu_blocker`
-/// to atomically swap hooks, and from `uninstall_cbt_menu_blocker` publicly.
-pub(crate) fn uninstall_cbt_menu_blocker() {
-    let hook = CBT_HOOK_HANDLE.swap(0, Ordering::Acquire);
-    if hook != 0 {
-        unsafe {
-            let _ = UnhookWindowsHookEx(HHOOK(hook as *mut c_void));
-        }
+pub(crate) fn has_active_cbt_hooks() -> bool {
+    ACTIVE_CBT_HOOK_THREADS.load(Ordering::Relaxed) != 0
+}
+
+fn unhook_raw(hook: isize) {
+    unsafe {
+        let _ = UnhookWindowsHookEx(HHOOK(hook as *mut c_void));
     }
 }
