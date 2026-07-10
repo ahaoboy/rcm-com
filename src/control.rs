@@ -87,7 +87,7 @@ fn run_control_listener() {
             {
                 Ok(s) => s,
                 Err(_) => {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                     continue;
                 }
             };
@@ -97,9 +97,9 @@ fn run_control_listener() {
                 continue;
             }
 
-            let mut buf = vec![0u8; 64];
-            if let Ok(n) = tokio::io::AsyncReadExt::read(&mut server, &mut buf).await
-                && let Ok(cmd) = serde_json::from_slice::<ControlCommand>(&buf[..n]) {
+            let mut buf = vec![];
+            if tokio::io::AsyncReadExt::read_to_end(&mut server, &mut buf).await.is_ok() {
+                if let Ok(cmd) = serde_json::from_slice::<ControlCommand>(&buf) {
                     match cmd {
                         ControlCommand::Enable => {
                             MENU_BLOCKING_ENABLED.store(true, Ordering::Relaxed)
@@ -109,11 +109,7 @@ fn run_control_listener() {
                         }
                     }
                 }
-
-            // Drop the server to close the pipe, then wait for the kernel
-            // to release the name before recreating.
-            drop(server);
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            }
         }
     });
 }
@@ -167,3 +163,4 @@ fn send_control(cmd: &ControlCommand) -> Result<()> {
          right-click in Explorer first to load the DLL"
     )))
 }
+
