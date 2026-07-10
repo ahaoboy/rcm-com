@@ -14,5 +14,9 @@ pub const IID_ICONTEXTMENU: GUID = GUID::from_u128(0x000214E4_0000_0000_C000_000
 pub const HANDLER_NAME: &str = "RcmContextMenu";
 
 /// Named pipe path used for communication between the shell extension DLL
-/// and the listening server process.
+/// and the listening server process (context-menu data).
 pub const PIPE_NAME: &str = r"\\.\pipe\rcm_com_pipe";
+
+/// Named pipe path for control commands (enable / disable menu blocking).
+/// The DLL listens on this pipe; external programs connect as clients.
+pub const CONTROL_PIPE_NAME: &str = r"\\.\pipe\rcm_com_control";

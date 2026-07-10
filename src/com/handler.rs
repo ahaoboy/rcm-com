@@ -274,7 +274,14 @@ unsafe extern "system" fn handler_query_context_menu(
         // The CBT hook (installed during IShellExtInit::Initialize) intercepts
         // TrackPopupMenu before any menu window is created. Returning E_FAIL
         // tells the shell we contributed no items.
-        E_FAIL
+        //
+        // When menu blocking is disabled, return S_OK (0 items) so the shell
+        // can display the native context menu normally.
+        if crate::control::is_enabled() {
+            E_FAIL
+        } else {
+            S_OK
+        }
     }
 }
 

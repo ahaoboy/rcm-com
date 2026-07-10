@@ -1,7 +1,7 @@
+use crate::consts::*;
+use crate::error::{RcmError, Result};
 use std::fmt::Display;
 use std::path::PathBuf;
-use crate::error::{RcmError, Result};
-use crate::consts::*;
 use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Shell::*;
@@ -26,27 +26,32 @@ impl RegKeyGuard {
 impl Drop for RegKeyGuard {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
-            unsafe { let _ = RegCloseKey(self.0); }
+            unsafe {
+                let _ = RegCloseKey(self.0);
+            }
         }
     }
 }
 
 fn dll_path() -> Result<PathBuf> {
-    let exe = std::env::current_exe().map_err(|e| RcmError::Environment(format!("Failed to get exe path: {e}")))?;
+    let exe = std::env::current_exe()
+        .map_err(|e| RcmError::Environment(format!("Failed to get exe path: {e}")))?;
     let dir = exe
         .parent()
         .ok_or_else(|| RcmError::Environment("Failed to get exe directory".to_string()))?;
     let dll = dir.join("rcm_com.dll");
     if !dll.exists() {
-        return Err(RcmError::Environment(format!("DLL not found at {}", dll.display())));
+        return Err(RcmError::Environment(format!(
+            "DLL not found at {}",
+            dll.display()
+        )));
     }
     Ok(dll)
 }
 
 fn set_reg_value(key: HKEY, name: Option<&str>, value: &str) -> Result<()> {
     let wide_val = to_wide(value);
-    let name_wide: Option<Vec<u16>> =
-        name.map(to_wide);
+    let name_wide: Option<Vec<u16>> = name.map(to_wide);
     let name_pcwstr = name_wide
         .as_ref()
         .map(|v| PCWSTR(v.as_ptr()))
@@ -97,15 +102,16 @@ fn open_key(parent: HKEY, subkey: &str) -> Result<HKEY> {
             if res == ERROR_FILE_NOT_FOUND {
                 return Err(RcmError::RegistryKeyNotFound(subkey.to_string()));
             }
-            return Err(RcmError::Registry(format!("RegOpenKeyExW({subkey}) failed: {res:?}")));
+            return Err(RcmError::Registry(format!(
+                "RegOpenKeyExW({subkey}) failed: {res:?}"
+            )));
         }
     }
     Ok(key)
 }
 
 fn get_reg_value(key: HKEY, name: Option<&str>) -> Result<String> {
-    let name_wide: Option<Vec<u16>> =
-        name.map(to_wide);
+    let name_wide: Option<Vec<u16>> = name.map(to_wide);
     let name_pcwstr = name_wide
         .as_ref()
         .map(|v| PCWSTR(v.as_ptr()))
@@ -113,16 +119,28 @@ fn get_reg_value(key: HKEY, name: Option<&str>) -> Result<String> {
 
     let mut buf_len = 0u32;
     unsafe {
-        RegQueryValueExW(key, name_pcwstr, None, None, None, Some(&mut buf_len)).ok()
+        RegQueryValueExW(key, name_pcwstr, None, None, None, Some(&mut buf_len))
+            .ok()
             .map_err(|e| RcmError::Registry(format!("RegQueryValueExW length failed: {e}")))?;
 
         let mut buf = vec![0u8; buf_len as usize];
-        RegQueryValueExW(key, name_pcwstr, None, None, Some(buf.as_mut_ptr()), Some(&mut buf_len)).ok()
-            .map_err(|e| RcmError::Registry(format!("RegQueryValueExW failed: {e}")))?;
+        RegQueryValueExW(
+            key,
+            name_pcwstr,
+            None,
+            None,
+            Some(buf.as_mut_ptr()),
+            Some(&mut buf_len),
+        )
+        .ok()
+        .map_err(|e| RcmError::Registry(format!("RegQueryValueExW failed: {e}")))?;
 
-        Ok(String::from_utf16_lossy(std::slice::from_raw_parts(buf.as_ptr() as *const u16, (buf_len / 2) as usize))
-            .trim_matches(char::from(0))
-            .to_string())
+        Ok(String::from_utf16_lossy(std::slice::from_raw_parts(
+            buf.as_ptr() as *const u16,
+            (buf_len / 2) as usize,
+        ))
+        .trim_matches(char::from(0))
+        .to_string())
     }
 }
 

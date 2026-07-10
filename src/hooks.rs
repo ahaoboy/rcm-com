@@ -46,9 +46,11 @@ unsafe extern "system" fn cbt_hook_proc(code: i32, _wparam: WPARAM, lparam: LPAR
                 let cs = &*(*cbt_ptr).lpcs;
                 // For system classes, lpszClass is MAKEINTATOM(32768) = 0x8000
                 if cs.lpszClass.0 as usize == 32768 {
-                    // Block this popup menu window — but keep the hook alive
-                    // so it can catch subsequent menu windows from other handlers.
-                    return LRESULT(1);
+                    // Only block if menu blocking is currently enabled.
+                    // When disabled, the native system menu is allowed to appear.
+                    if crate::control::is_enabled() {
+                        return LRESULT(1);
+                    }
                 }
             }
         }

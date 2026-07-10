@@ -84,9 +84,9 @@ pub(crate) fn write_log(err: impl std::fmt::Display) {
             .create(true)
             .append(true)
             .open(path)
-        {
-            let _ = writeln!(file, "[{}] {}", timestamp(), err);
-        }
+    {
+        let _ = writeln!(file, "[{}] {}", timestamp(), err);
+    }
 }
 
 /// Return a UTC timestamp string for log entries.

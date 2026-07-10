@@ -8,12 +8,14 @@ pub mod server;
 
 // ── private modules ──────────────────────────────────────────────────────
 pub(crate) mod com;
+pub(crate) mod control;
 pub(crate) mod helpers;
 pub(crate) mod hooks;
 pub(crate) mod types;
 
 // ── public re-exports ────────────────────────────────────────────────────
 pub use consts::PIPE_NAME;
+pub use control::{disable, enable};
 pub use types::{ContextMenuInfo, Event};
 
 use std::ffi::c_void;
@@ -172,9 +174,7 @@ unsafe extern "system" fn DllGetClassObject(
 
 #[unsafe(no_mangle)]
 extern "system" fn DllCanUnloadNow() -> HRESULT {
-    if helpers::DLL_REF_COUNT.load(Ordering::Relaxed) == 0
-        && !hooks::has_active_cbt_hooks()
-    {
+    if helpers::DLL_REF_COUNT.load(Ordering::Relaxed) == 0 && !hooks::has_active_cbt_hooks() {
         S_OK
     } else {
         S_FALSE

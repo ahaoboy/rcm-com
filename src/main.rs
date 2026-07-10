@@ -28,6 +28,10 @@ enum Commands {
     },
     /// Restart Windows Explorer (stop, wait 5s, start)
     RestartExplorer,
+    /// Stop blocking — let the native context menu appear
+    Disable,
+    /// Block the native context menu (default behaviour)
+    Enable,
 }
 
 #[derive(Subcommand)]
@@ -90,6 +94,12 @@ async fn main() {
         Commands::RestartExplorer => {
             restart_explorer(std::time::Duration::from_secs(5)).map_err(RcmError::from)
         }
+        Commands::Enable => rcm_com::enable().map(|_| {
+            println!("Menu blocking ENABLED — native context menu will be hidden.");
+        }),
+        Commands::Disable => rcm_com::disable().map(|_| {
+            println!("Menu blocking DISABLED — native context menu will be shown.");
+        }),
     };
 
     if let Err(e) = result {
