@@ -150,6 +150,8 @@ fn get_handler_paths() -> Vec<String> {
         format!("lnkfile\\shellex\\ContextMenuHandlers\\{HANDLER_NAME}"),
         format!("Directory\\shellex\\ContextMenuHandlers\\{HANDLER_NAME}"),
         format!("Directory\\Background\\shellex\\ContextMenuHandlers\\{HANDLER_NAME}"),
+        format!("Drive\\shellex\\ContextMenuHandlers\\{HANDLER_NAME}"),
+        format!("Folder\\shellex\\ContextMenuHandlers\\{HANDLER_NAME}"),
     ]
 }
 
@@ -239,6 +241,8 @@ pub struct Status {
     pub handler_lnkfile_ok: bool,
     pub handler_directory_ok: bool,
     pub handler_background_ok: bool,
+    pub handler_drive_ok: bool,
+    pub handler_folder_ok: bool,
     pub is_approved: bool,
 }
 
@@ -251,6 +255,8 @@ impl Status {
             && self.handler_lnkfile_ok
             && self.handler_directory_ok
             && self.handler_background_ok
+            && self.handler_drive_ok
+            && self.handler_folder_ok
             && self.is_approved
     }
 }
@@ -300,6 +306,8 @@ impl Display for Status {
         print_handler(f, self.handler_lnkfile_ok, &paths[1])?;
         print_handler(f, self.handler_directory_ok, &paths[2])?;
         print_handler(f, self.handler_background_ok, &paths[3])?;
+        print_handler(f, self.handler_drive_ok, &paths[4])?;
+        print_handler(f, self.handler_folder_ok, &paths[5])?;
 
         if self.is_approved {
             writeln!(f, "  ✅ Approved")?;
@@ -332,6 +340,8 @@ pub fn status() -> Result<Status> {
         handler_lnkfile_ok: false,
         handler_directory_ok: false,
         handler_background_ok: false,
+        handler_drive_ok: false,
+        handler_folder_ok: false,
         is_approved: false,
     };
 
@@ -367,6 +377,8 @@ pub fn status() -> Result<Status> {
     status.handler_lnkfile_ok = check_handler(&handler_paths[1]);
     status.handler_directory_ok = check_handler(&handler_paths[2]);
     status.handler_background_ok = check_handler(&handler_paths[3]);
+    status.handler_drive_ok = check_handler(&handler_paths[4]);
+    status.handler_folder_ok = check_handler(&handler_paths[5]);
 
     // Approved
     let approved_path = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Shell Extensions\\Approved";
