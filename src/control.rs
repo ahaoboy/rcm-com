@@ -98,8 +98,8 @@ fn run_control_listener() {
             }
 
             let mut buf = vec![];
-            if tokio::io::AsyncReadExt::read_to_end(&mut server, &mut buf).await.is_ok() {
-                if let Ok(cmd) = serde_json::from_slice::<ControlCommand>(&buf) {
+            if tokio::io::AsyncReadExt::read_to_end(&mut server, &mut buf).await.is_ok()
+                && let Ok(cmd) = serde_json::from_slice::<ControlCommand>(&buf) {
                     match cmd {
                         ControlCommand::Enable => {
                             MENU_BLOCKING_ENABLED.store(true, Ordering::Relaxed)
@@ -109,7 +109,6 @@ fn run_control_listener() {
                         }
                     }
                 }
-            }
         }
     });
 }
