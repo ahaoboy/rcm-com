@@ -255,18 +255,26 @@ unsafe extern "system" fn handler_query_context_menu(
                 info.event = Event::Menu { flags: uflags };
             }
 
-            // Send the info over the named pipe to the listening process.
-            let send_result = (|| -> crate::error::Result<()> {
-                let json_str = serde_json::to_string(&*info)?;
-                let mut pipe = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(crate::consts::PIPE_NAME)?;
-                std::io::Write::write_all(&mut pipe, json_str.as_bytes())?;
-                Ok(())
-            })();
+            // Skip CMF_VERBSONLY queries: these come from the lnkfile
+            // registration and contain the resolved shortcut *target*,
+            // not the .lnk file itself. The subsequent * handler call
+            // (without CMF_VERBSONLY) will deliver the actual file path.
+            const CMF_VERBSONLY: u32 = 0x00000002;
 
-            if let Err(err) = send_result {
-                helpers::write_log(err);
+            if uflags & CMF_VERBSONLY == 0 {
+                // Send the info over the named pipe to the listening process.
+                let send_result = (|| -> crate::error::Result<()> {
+                    let json_str = serde_json::to_string(&*info)?;
+                    let mut pipe = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(crate::consts::PIPE_NAME)?;
+                    std::io::Write::write_all(&mut pipe, json_str.as_bytes())?;
+                    Ok(())
+                })();
+
+                if let Err(err) = send_result {
+                    helpers::write_log(err);
+                }
             }
         }
 
