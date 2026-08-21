@@ -31,6 +31,8 @@ use crate::error::Result;
 enum ControlCommand {
     Enable,
     Disable,
+    /// Query the current blocking state — the server replies with `true`/`false`.
+    Query,
 }
 
 // =============================================================================
@@ -48,14 +50,23 @@ static LISTENER_STARTED: OnceLock<()> = OnceLock::new();
 // DLL-internal check (crate-private)
 // =============================================================================
 
-/// Check whether menu blocking is currently enabled.
+/// Ensure the control-pipe listener thread is running.
 ///
-/// Called from the CBT hook and `QueryContextMenu` on every right-click.
-/// The first call lazily spawns the background pipe-listener thread.
-pub fn is_enabled() -> bool {
+/// Called from `DllMain(DLL_PROCESS_ATTACH)` so the control pipe exists as
+/// soon as the DLL is loaded. Idempotent — the listener is spawned at most
+/// once per process.
+pub fn start() {
     LISTENER_STARTED.get_or_init(|| {
         thread::spawn(run_control_listener);
     });
+}
+
+/// Check whether menu blocking is currently enabled.
+///
+/// Called from the CBT hook and `QueryContextMenu` on every right-click.
+/// The listener is already started by [`start`] during DLL load, so no lazy
+/// spawn is needed here.
+pub fn is_enabled() -> bool {
     MENU_BLOCKING_ENABLED.load(Ordering::Relaxed)
 }
 
@@ -97,16 +108,28 @@ fn run_control_listener() {
                 continue;
             }
 
-            let mut buf = vec![];
-            if tokio::io::AsyncReadExt::read_to_end(&mut server, &mut buf)
-                .await
-                .is_ok()
-                && let Ok(cmd) = serde_json::from_slice::<ControlCommand>(&buf)
-            {
+            // Read a single command. A bounded read is used instead of
+            // read_to_end so the server does not wait for the client to close
+            // its write end — Query clients keep the connection open to read
+            // the response back.
+            let mut buf = [0u8; 64];
+            let n = tokio::io::AsyncReadExt::read(&mut server, &mut buf).await;
+            let Ok(n) = n else { continue };
+            if n == 0 {
+                continue;
+            }
+            if let Ok(cmd) = serde_json::from_slice::<ControlCommand>(&buf[..n]) {
                 match cmd {
                     ControlCommand::Enable => MENU_BLOCKING_ENABLED.store(true, Ordering::Relaxed),
                     ControlCommand::Disable => {
                         MENU_BLOCKING_ENABLED.store(false, Ordering::Relaxed)
+                    }
+                    ControlCommand::Query => {
+                        let state = MENU_BLOCKING_ENABLED.load(Ordering::Relaxed);
+                        use tokio::io::AsyncWriteExt;
+                        let _ = server
+                            .write_all(serde_json::to_vec(&state).unwrap_or_default().as_slice())
+                            .await;
                     }
                 }
             }
@@ -131,6 +154,37 @@ pub fn enable() -> Result<()> {
 /// Sends `{"command":"disable"}` over the control named pipe.
 pub fn disable() -> Result<()> {
     send_control(&ControlCommand::Disable)
+}
+
+/// Query whether context-menu blocking is currently enabled.
+///
+/// Sends `{"command":"query"}` over the control named pipe and reads the
+/// current state back from the DLL, so callers always get the *real* state
+/// (unlike [`is_enabled`], which only reads this process's local copy).
+pub fn query() -> Result<bool> {
+    let cmd = serde_json::to_vec(&ControlCommand::Query)?;
+    let max_attempts = 30;
+    for _ in 0..max_attempts {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(CONTROL_PIPE_NAME)
+        {
+            Ok(mut pipe) => {
+                std::io::Write::write_all(&mut pipe, &cmd)?;
+                let mut buf = Vec::new();
+                std::io::Read::read_to_end(&mut pipe, &mut buf)?;
+                return serde_json::from_slice::<bool>(&buf).map_err(Into::into);
+            }
+            Err(_) => {
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    Err(crate::error::RcmError::Environment(format!(
+        "Control pipe not available after {max_attempts} attempts — \
+         right-click in Explorer first to load the DLL"
+    )))
 }
 
 // =============================================================================

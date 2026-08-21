@@ -15,7 +15,7 @@ pub(crate) mod types;
 
 // ── public re-exports ────────────────────────────────────────────────────
 pub use consts::PIPE_NAME;
-pub use control::{disable, enable, is_enabled};
+pub use control::{disable, enable, is_enabled, query, start};
 pub use types::{ContextMenuInfo, Event};
 
 use std::ffi::c_void;
@@ -137,6 +137,10 @@ unsafe extern "system" fn DllMain(hinstance: HMODULE, reason: u32, _reserved: *m
         if reason == DLL_PROCESS_ATTACH {
             DLL_MODULE.store(hinstance.0 as usize, Ordering::Release);
             let _ = DisableThreadLibraryCalls(hinstance);
+            // Start the control-pipe listener eagerly so that enable/disable/
+            // query commands work as soon as the DLL is loaded, without
+            // requiring a right-click to lazily spawn it.
+            crate::control::start();
         }
         1 // TRUE
     }

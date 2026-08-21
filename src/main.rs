@@ -32,6 +32,8 @@ enum Commands {
     Disable,
     /// Block the native context menu (default behaviour)
     Enable,
+    /// Query whether menu blocking is currently enabled
+    Query,
 }
 
 #[derive(Subcommand)]
@@ -100,6 +102,13 @@ async fn main() {
         Commands::Disable => rcm_com::disable().map(|_| {
             println!("Menu blocking DISABLED — native context menu will be shown.");
         }),
+        Commands::Query => match rcm_com::query() {
+            Ok(enabled) => {
+                println!("Menu blocking: {}", if enabled { "ENABLED" } else { "DISABLED" });
+                Ok(())
+            }
+            Err(e) => Err(e),
+        },
     };
 
     if let Err(e) = result {
