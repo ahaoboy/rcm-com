@@ -52,7 +52,7 @@ static LISTENER_STARTED: OnceLock<()> = OnceLock::new();
 ///
 /// Called from the CBT hook and `QueryContextMenu` on every right-click.
 /// The first call lazily spawns the background pipe-listener thread.
-pub(crate) fn is_enabled() -> bool {
+pub fn is_enabled() -> bool {
     LISTENER_STARTED.get_or_init(|| {
         thread::spawn(run_control_listener);
     });
@@ -98,17 +98,18 @@ fn run_control_listener() {
             }
 
             let mut buf = vec![];
-            if tokio::io::AsyncReadExt::read_to_end(&mut server, &mut buf).await.is_ok()
-                && let Ok(cmd) = serde_json::from_slice::<ControlCommand>(&buf) {
-                    match cmd {
-                        ControlCommand::Enable => {
-                            MENU_BLOCKING_ENABLED.store(true, Ordering::Relaxed)
-                        }
-                        ControlCommand::Disable => {
-                            MENU_BLOCKING_ENABLED.store(false, Ordering::Relaxed)
-                        }
+            if tokio::io::AsyncReadExt::read_to_end(&mut server, &mut buf)
+                .await
+                .is_ok()
+                && let Ok(cmd) = serde_json::from_slice::<ControlCommand>(&buf)
+            {
+                match cmd {
+                    ControlCommand::Enable => MENU_BLOCKING_ENABLED.store(true, Ordering::Relaxed),
+                    ControlCommand::Disable => {
+                        MENU_BLOCKING_ENABLED.store(false, Ordering::Relaxed)
                     }
                 }
+            }
         }
     });
 }
@@ -162,4 +163,3 @@ fn send_control(cmd: &ControlCommand) -> Result<()> {
          right-click in Explorer first to load the DLL"
     )))
 }
-
