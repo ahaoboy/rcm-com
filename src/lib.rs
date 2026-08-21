@@ -15,7 +15,7 @@ pub(crate) mod types;
 
 // ── public re-exports ────────────────────────────────────────────────────
 pub use consts::PIPE_NAME;
-pub use control::{disable, enable};
+pub use control::{disable, enable, is_enabled};
 pub use types::{ContextMenuInfo, Event};
 
 use std::ffi::c_void;
