@@ -16,11 +16,13 @@ pub(crate) mod pipe;
 pub(crate) mod types;
 
 // ── public re-exports ────────────────────────────────────────────────────
+pub use cmd::{HandlerStatus, Status, register, status, unregister};
 pub use consts::PIPE_NAME;
 pub use control::{
     disable, enable, get_client, get_log_level, get_shift_bypass, is_enabled, query, set_client,
     set_log_level, set_shift_bypass, shift_bypass, start, try_set_remote_log_level,
 };
+pub use error::{RcmError, Result};
 pub use logging::LogLevel;
 pub use server::{listen, listen_with, ListenOptions};
 pub use types::{ContextMenuInfo, Event};
