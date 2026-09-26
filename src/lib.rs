@@ -4,6 +4,7 @@
 pub mod cmd;
 pub mod consts;
 pub mod error;
+pub mod logging;
 pub mod server;
 
 // ── private modules ──────────────────────────────────────────────────────
@@ -15,7 +16,7 @@ pub(crate) mod types;
 
 // ── public re-exports ────────────────────────────────────────────────────
 pub use consts::PIPE_NAME;
-pub use control::{disable, enable, is_enabled, query, start};
+pub use control::{disable, enable, is_enabled, query, start, try_set_remote_log_level};
 pub use types::{ContextMenuInfo, Event};
 
 use std::ffi::c_void;
@@ -105,6 +106,13 @@ unsafe extern "system" fn cf_create_instance(
         if !punk_outer.is_null() {
             return CLASS_E_NOAGGREGATION;
         }
+        // Initialise logging and start the control-pipe listener here (a
+        // normal COM activation thread) rather than from `DllMain`. `DllMain`
+        // runs under the loader lock, where spawning threads, building a tokio
+        // runtime, or touching the registry can deadlock Explorer. Both calls
+        // are idempotent.
+        crate::logging::init_dll();
+        crate::control::start();
         let handler = ContextMenuHandler::new();
         let ptr = Box::into_raw(Box::new(handler));
         // QueryInterface via handler IShellExtInit vtable
@@ -137,10 +145,9 @@ unsafe extern "system" fn DllMain(hinstance: HMODULE, reason: u32, _reserved: *m
         if reason == DLL_PROCESS_ATTACH {
             DLL_MODULE.store(hinstance.0 as usize, Ordering::Release);
             let _ = DisableThreadLibraryCalls(hinstance);
-            // Start the control-pipe listener eagerly so that enable/disable/
-            // query commands work as soon as the DLL is loaded, without
-            // requiring a right-click to lazily spawn it.
-            crate::control::start();
+            // NOTE: do NOT log, start threads, or touch the registry here.
+            // `DllMain` runs while the loader lock is held; logging and the
+            // pipe listeners are initialised lazily from COM activation.
         }
         1 // TRUE
     }
@@ -178,7 +185,10 @@ unsafe extern "system" fn DllGetClassObject(
 
 #[unsafe(no_mangle)]
 extern "system" fn DllCanUnloadNow() -> HRESULT {
-    if helpers::DLL_REF_COUNT.load(Ordering::Relaxed) == 0 && !hooks::has_active_cbt_hooks() {
+    if helpers::DLL_REF_COUNT.load(Ordering::Relaxed) == 0
+        && !hooks::has_active_cbt_hooks()
+        && !helpers::sender_active()
+    {
         S_OK
     } else {
         S_FALSE

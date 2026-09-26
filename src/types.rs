@@ -1,6 +1,32 @@
 //! Data types for right-click context menu information captured by the shell extension.
 
 use serde::{Deserialize, Serialize};
+use windows::Win32::UI::Shell::{
+    CMF_ASYNCVERBSTATE, CMF_CANRENAME, CMF_DEFAULTONLY, CMF_DISABLEDVERBS, CMF_DONOTPICKDEFAULT,
+    CMF_EXPLORE, CMF_EXTENDEDVERBS, CMF_INCLUDESTATIC, CMF_ITEMMENU, CMF_NODEFAULT, CMF_NORMAL,
+    CMF_NOVERBS, CMF_OPTIMIZEFORINVOKE, CMF_SYNCCASCADEMENU, CMF_VERBSONLY,
+};
+
+/// Human-readable names for every `CMF_*` bit understood by Explorer.
+///
+/// Single source of truth for flag decoding, kept in sync with the
+/// `windows`-crate constants rather than re-declaring magic numbers.
+const CMF_FLAGS: [(u32, &str); 14] = [
+    (CMF_DEFAULTONLY, "CMF_DEFAULTONLY"),
+    (CMF_VERBSONLY, "CMF_VERBSONLY"),
+    (CMF_EXPLORE, "CMF_EXPLORE"),
+    (CMF_NOVERBS, "CMF_NOVERBS"),
+    (CMF_CANRENAME, "CMF_CANRENAME"),
+    (CMF_NODEFAULT, "CMF_NODEFAULT"),
+    (CMF_INCLUDESTATIC, "CMF_INCLUDESTATIC"),
+    (CMF_ITEMMENU, "CMF_ITEMMENU"),
+    (CMF_EXTENDEDVERBS, "CMF_EXTENDEDVERBS"),
+    (CMF_DISABLEDVERBS, "CMF_DISABLEDVERBS"),
+    (CMF_ASYNCVERBSTATE, "CMF_ASYNCVERBSTATE"),
+    (CMF_OPTIMIZEFORINVOKE, "CMF_OPTIMIZEFORINVOKE"),
+    (CMF_SYNCCASCADEMENU, "CMF_SYNCCASCADEMENU"),
+    (CMF_DONOTPICKDEFAULT, "CMF_DONOTPICKDEFAULT"),
+];
 
 /// The type of event that triggered the context menu.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,56 +56,15 @@ impl Event {
     /// Return a human-readable representation of the flags bitmask.
     pub fn flags_str(&self) -> String {
         let uflags = self.flags();
-        let mut flags_str = Vec::new();
-        if uflags == 0 {
-            flags_str.push("CMF_NORMAL");
+        if uflags == CMF_NORMAL {
+            return "CMF_NORMAL".to_string();
         }
-        if uflags & 0x00000001 != 0 {
-            flags_str.push("CMF_DEFAULTONLY");
-        }
-        if uflags & 0x00000002 != 0 {
-            flags_str.push("CMF_VERBSONLY");
-        }
-        if uflags & 0x00000004 != 0 {
-            flags_str.push("CMF_EXPLORE");
-        }
-        if uflags & 0x00000008 != 0 {
-            flags_str.push("CMF_NOVERBS");
-        }
-        if uflags & 0x00000010 != 0 {
-            flags_str.push("CMF_CANRENAME");
-        }
-        if uflags & 0x00000020 != 0 {
-            flags_str.push("CMF_NODEFAULT");
-        }
-        if uflags & 0x00000040 != 0 {
-            flags_str.push("CMF_INCLUDESTATIC");
-        }
-        if uflags & 0x00000080 != 0 {
-            flags_str.push("CMF_ITEMMENU");
-        }
-        if uflags & 0x00000100 != 0 {
-            flags_str.push("CMF_EXTENDEDVERBS");
-        }
-        if uflags & 0x00000200 != 0 {
-            flags_str.push("CMF_DISABLEDVERBS");
-        }
-        if uflags & 0x00000400 != 0 {
-            flags_str.push("CMF_ASYNCVERBSTATE");
-        }
-        if uflags & 0x00000800 != 0 {
-            flags_str.push("CMF_OPTIMIZEFORINVOKE");
-        }
-        if uflags & 0x00001000 != 0 {
-            flags_str.push("CMF_SYNCCASCADEMENU");
-        }
-        if uflags & 0x00002000 != 0 {
-            flags_str.push("CMF_DONOTPICKDEFAULT");
-        }
-        if uflags & 0x00010000 != 0 {
-            flags_str.push("CMF_DVFILE");
-        }
-        flags_str.join(" | ")
+        let names: Vec<&str> = CMF_FLAGS
+            .iter()
+            .filter(|(bit, _)| uflags & bit != 0)
+            .map(|(_, name)| *name)
+            .collect();
+        names.join(" | ")
     }
 }
 

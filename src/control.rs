@@ -1,13 +1,16 @@
 //! Menu-blocking toggle — global `AtomicBool` + tokio control pipe.
 //!
-//! A background thread (spawned lazily on first right-click) listens on
-//! `\\.\pipe\rcm_com_control`.  External programs send JSON commands like
-//! `{"command":"disable"}` over this pipe to toggle the global flag.
+//! A background thread listens on `\\.\pipe\rcm_com_control`.  External
+//! programs send JSON commands like `{"command":"disable"}` over this pipe to
+//! toggle the global flag.  The thread is started lazily from COM activation
+//! (see `cf_create_instance`) — never from `DllMain`, which runs under the
+//! loader lock.
 //!
 //! The CBT hook and `QueryContextMenu` consult [`is_enabled`] before
 //! intercepting the native menu.
 //!
-//! Only two functions are publicly exposed: [`enable`] and [`disable`].
+//! Public API: [`enable`], [`disable`], [`query`], [`start`], and
+//! [`try_set_remote_log_level`].
 
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
@@ -33,6 +36,8 @@ enum ControlCommand {
     Disable,
     /// Query the current blocking state — the server replies with `true`/`false`.
     Query,
+    /// Change the log level of the running DLL, e.g. `{"command":"log","level":"debug"}`.
+    Log { level: String },
 }
 
 // =============================================================================
@@ -52,9 +57,9 @@ static LISTENER_STARTED: OnceLock<()> = OnceLock::new();
 
 /// Ensure the control-pipe listener thread is running.
 ///
-/// Called from `DllMain(DLL_PROCESS_ATTACH)` so the control pipe exists as
-/// soon as the DLL is loaded. Idempotent — the listener is spawned at most
-/// once per process.
+/// Called from `cf_create_instance` (a normal COM activation thread) so the
+/// control pipe exists as soon as the shell instantiates the handler.
+/// Idempotent — the listener is spawned at most once per process.
 pub fn start() {
     LISTENER_STARTED.get_or_init(|| {
         thread::spawn(run_control_listener);
@@ -93,9 +98,16 @@ fn run_control_listener() {
 
     rt.block_on(async {
         loop {
-            let mut server = match tokio::net::windows::named_pipe::ServerOptions::new()
-                .create(CONTROL_PIPE_NAME)
-            {
+            // Restrict the control pipe to the current user and Local System so
+            // other local processes cannot toggle menu blocking.
+            let mut security = crate::helpers::PipeSecurity::new();
+            // Safety: `security` owns a valid SECURITY_ATTRIBUTES (or a null
+            // descriptor on fallback) that outlives this call.
+            let created = unsafe {
+                tokio::net::windows::named_pipe::ServerOptions::new()
+                    .create_with_security_attributes_raw(CONTROL_PIPE_NAME, security.as_ptr())
+            };
+            let mut server = match created {
                 Ok(s) => s,
                 Err(_) => {
                     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -131,6 +143,11 @@ fn run_control_listener() {
                             .write_all(serde_json::to_vec(&state).unwrap_or_default().as_slice())
                             .await;
                     }
+                    ControlCommand::Log { level } => {
+                        if let Some(filter) = crate::logging::parse_level(&level) {
+                            crate::logging::apply_level(filter);
+                        }
+                    }
                 }
             }
         }
@@ -138,7 +155,7 @@ fn run_control_listener() {
 }
 
 // =============================================================================
-// Public API — the only two functions exposed to consumers
+// Public API
 // =============================================================================
 
 /// Enable context-menu blocking (the default).
@@ -185,6 +202,26 @@ pub fn query() -> Result<bool> {
         "Control pipe not available after {max_attempts} attempts — \
          right-click in Explorer first to load the DLL"
     )))
+}
+
+/// Best-effort request to change the log level of a running DLL.
+///
+/// Writes a single command without retrying — used by `rcm log`, where the
+/// 3-second retry of [`send_control`] would be a poor experience when the shell
+/// extension is not currently loaded. Returns `true` if the command was sent.
+pub fn try_set_remote_log_level(level: &str) -> bool {
+    let Ok(json) = serde_json::to_vec(&ControlCommand::Log {
+        level: level.to_string(),
+    }) else {
+        return false;
+    };
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .open(CONTROL_PIPE_NAME)
+    {
+        Ok(mut pipe) => std::io::Write::write_all(&mut pipe, &json).is_ok(),
+        Err(_) => false,
+    }
 }
 
 // =============================================================================

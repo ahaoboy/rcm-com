@@ -1,20 +1,29 @@
 //! WH_CBT hook — prevents the default Windows context menu from appearing.
 //!
-//! A thread-local WH_CBT hook monitors `HCBT_CREATEWND` and blocks any
-//! window of class `#32768` (the system popup-menu class).
+//! A per-thread WH_CBT hook monitors `HCBT_CREATEWND` and blocks creation of
+//! the system popup-menu window (class atom `#32768`).
 //!
-//! ## Lifecycle (critical — do not change without understanding)
+//! ## Scope
 //!
-//! The hook is thread-local because `WH_CBT` hooks are installed per Explorer
-//! thread. It is deliberately NOT uninstalled in `handler_release` because
-//! `TrackPopupMenu` may be called by Explorer *after* the handler has been
-//! released. Instead, each new `Initialize` call refreshes the hook for the
-//! current thread only. The OS automatically cleans up hooks when their
-//! installing threads exit.
+//! The hook is installed when a context-menu handler is initialized and only
+//! blocks menus for a short window afterwards ([`MENU_BLOCK_TTL_MS`]). Without
+//! this bound, every `#32768` window created on the thread — including
+//! unrelated shell popups and dropdowns — was suppressed.
+//!
+//! ## Lifecycle
+//!
+//! Hooks are installed per Explorer thread (`WH_CBT` is bound to the thread id
+//! passed to `SetWindowsHookExW`). A background janitor thread unhooks every
+//! remaining hook once the blocking window has elapsed and then exits, so the
+//! DLL can become unloadable again. Each new `Initialize` refresh the window
+//! and re-installs on the current thread as needed.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -22,35 +31,57 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::helpers::DLL_MODULE;
 
-static ACTIVE_CBT_HOOK_THREADS: AtomicUsize = AtomicUsize::new(0);
+/// How long after a handler is initialized new popup menus are blocked.
+const MENU_BLOCK_TTL_MS: u64 = 3_000;
+/// How often the janitor checks whether the blocking window has elapsed.
+const JANITOR_POLL_MS: u64 = 200;
+
+/// Monotonic reference for deadline computation.
+static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Absolute (process-relative) millisecond deadline until which new popup
+/// menus are blocked. `0` means "not blocking".
+static BLOCK_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of currently installed CBT hooks.
+static ACTIVE_CBT_HOOKS: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether the janitor thread is currently running.
+static JANITOR_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Installed hook handles keyed by the owning thread id.
+static HOOKS: LazyLock<Mutex<HashMap<u32, isize>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 thread_local! {
-    /// Handle of the active WH_CBT hook for this Explorer thread.
+    /// Handle of the active WH_CBT hook for this thread (unused directly; kept
+    /// so a thread's hook can be identified) — see [`HOOKS`] for the registry.
     static CBT_HOOK_HANDLE: Cell<isize> = const { Cell::new(0) };
+}
+
+fn monotonic_ms() -> u64 {
+    START.elapsed().as_millis() as u64
+}
+
+fn blocking_active() -> bool {
+    let deadline = BLOCK_DEADLINE_MS.load(Ordering::Acquire);
+    deadline != 0 && monotonic_ms() <= deadline
 }
 
 /// CBT hook procedure — called before windows are created on our thread.
 ///
 /// When `code == HCBT_CREATEWND` (3), `lparam` points to a `CBT_CREATEWNDW`
-/// whose `lpcs->lpszClass` identifies the window class. A popup menu has
-/// class atom 32768 (0x8000). We return 1 to prevent its creation.
-///
-/// The hook never unhooks itself; it stays alive across handler lifecycles.
-/// See module-level docs for the rationale.
+/// whose `lpcs->lpszClass` identifies the window class. A popup menu has class
+/// atom 32768 (0x8000). We return 1 to prevent its creation.
 unsafe extern "system" fn cbt_hook_proc(code: i32, _wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // HCBT_CREATEWND = 3
-    if code == 3 {
+    if code == 3 && crate::control::is_enabled() && blocking_active() {
         unsafe {
             let cbt_ptr = lparam.0 as *const CBT_CREATEWNDW;
-            if !cbt_ptr.is_null() {
+            if !cbt_ptr.is_null() && !(*cbt_ptr).lpcs.is_null() {
                 let cs = &*(*cbt_ptr).lpcs;
-                // For system classes, lpszClass is MAKEINTATOM(32768) = 0x8000
+                // For system classes, lpszClass is MAKEINTATOM(32768) = 0x8000.
                 if cs.lpszClass.0 as usize == 32768 {
-                    // Only block if menu blocking is currently enabled.
-                    // When disabled, the native system menu is allowed to appear.
-                    if crate::control::is_enabled() {
-                        return LRESULT(1);
-                    }
+                    return LRESULT(1);
                 }
             }
         }
@@ -59,38 +90,71 @@ unsafe extern "system" fn cbt_hook_proc(code: i32, _wparam: WPARAM, lparam: LPAR
     unsafe { CallNextHookEx(None, code, _wparam, lparam) }
 }
 
-/// Install a WH_CBT hook for the current Explorer thread.
-///
-/// A process-global hook handle is incorrect here: `WH_CBT` is bound to the
-/// thread id passed to `SetWindowsHookExW`. Explorer can create context menus
-/// on different COM apartment threads over time, so each thread needs its own
-/// hook handle. Otherwise one thread can accidentally uninstall another
-/// thread's hook and native menus start leaking through intermittently.
+/// Install (or refresh) the WH_CBT hook for the current Explorer thread and
+/// extend the blocking window.
 pub(crate) fn install_cbt_menu_blocker() {
-    unsafe {
-        let hinstance = HINSTANCE(DLL_MODULE.load(Ordering::Acquire) as *mut c_void);
-        let hook = SetWindowsHookExW(
-            WH_CBT,
-            Some(cbt_hook_proc),
-            Some(hinstance),
-            GetCurrentThreadId(),
-        );
-        if let Ok(hook) = hook {
-            CBT_HOOK_HANDLE.with(|cell| {
-                let old_hook = cell.replace(hook.0 as isize);
-                if old_hook == 0 {
-                    ACTIVE_CBT_HOOK_THREADS.fetch_add(1, Ordering::Relaxed);
-                }
-                if old_hook != 0 && old_hook != hook.0 as isize {
-                    unhook_raw(old_hook);
-                }
-            });
+    BLOCK_DEADLINE_MS.store(monotonic_ms().saturating_add(MENU_BLOCK_TTL_MS), Ordering::Release);
+
+    let tid = unsafe { GetCurrentThreadId() };
+    let mut hooks = HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let std::collections::hash_map::Entry::Vacant(entry) = hooks.entry(tid) {
+        unsafe {
+            let hinstance = HINSTANCE(DLL_MODULE.load(Ordering::Acquire) as *mut c_void);
+            if let Ok(hook) = SetWindowsHookExW(WH_CBT, Some(cbt_hook_proc), Some(hinstance), tid) {
+                entry.insert(hook.0 as isize);
+                ACTIVE_CBT_HOOKS.fetch_add(1, Ordering::Relaxed);
+                CBT_HOOK_HANDLE.with(|cell| cell.set(hook.0 as isize));
+            }
         }
+    }
+
+    // Spawn the janitor while holding the lock so its shutdown path (which
+    // also holds the lock) can never race with a fresh install.
+    ensure_janitor_locked();
+}
+
+/// Whether any CBT hook is installed or a blocking window is still in effect.
+pub(crate) fn has_active_cbt_hooks() -> bool {
+    ACTIVE_CBT_HOOKS.load(Ordering::Relaxed) != 0 || JANITOR_RUNNING.load(Ordering::Acquire)
+}
+
+/// Must be called while holding the [`HOOKS`] lock.
+fn ensure_janitor_locked() {
+    if JANITOR_RUNNING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("rcm-hook-janitor".into())
+        .spawn(janitor_loop);
+    if spawned.is_err() {
+        JANITOR_RUNNING.store(false, Ordering::Release);
     }
 }
 
-pub(crate) fn has_active_cbt_hooks() -> bool {
-    ACTIVE_CBT_HOOK_THREADS.load(Ordering::Relaxed) != 0
+/// Periodically unhooks everything once the blocking window has elapsed, then
+/// exits so the DLL is not kept resident by this thread.
+fn janitor_loop() {
+    loop {
+        std::thread::sleep(Duration::from_millis(JANITOR_POLL_MS));
+
+        let mut hooks = HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+        if blocking_active() {
+            continue;
+        }
+
+        for (_, hook) in hooks.drain() {
+            unhook_raw(hook);
+            ACTIVE_CBT_HOOKS.fetch_sub(1, Ordering::Relaxed);
+        }
+
+        // Re-check under the lock: if a new install extended the window in the
+        // meantime, keep running; otherwise shut down.
+        if !blocking_active() {
+            JANITOR_RUNNING.store(false, Ordering::Release);
+            break;
+        }
+    }
 }
 
 fn unhook_raw(hook: isize) {

@@ -48,6 +48,50 @@ rcm restart-explorer
 | `rcm menu win11` | Switch back to Windows 11 default context menu |
 | `rcm menu default` | Set classic menu as default (`-c false` to disable) |
 | `rcm restart-explorer` | Restart Explorer (stop → wait 5s → start) |
+| `rcm enable` | Block (hide) the native context menu — the default |
+| `rcm disable` | Stop blocking — let the native context menu appear |
+| `rcm query` | Print whether menu blocking is currently enabled |
+| `rcm log [level]` | Show or set the log level (see [Logging](#logging)) |
+
+Every command exits `0` on success and `1` on failure, so scripts and CI can
+detect errors.
+
+## Logging
+
+All output — command results, diagnostics, and DLL logs — is emitted through
+the [`log`](https://docs.rs/log) facade and controlled by a single level:
+
+| Level | Shows |
+|---|---|
+| `off` | Nothing |
+| `error` | Failures only |
+| `warn` | Failures and warnings |
+| `info` | Normal command output (default) |
+| `debug` | Adds verbose detail (e.g. the full context-menu struct) |
+| `trace` | Everything |
+
+```bash
+rcm log info      # set the level (persisted for future runs)
+rcm log           # print the current level
+rcm log debug     # include the full struct dumped by `rcm start`
+```
+
+The level is stored under `HKCU\Software\RcmCom\LogLevel` and applied to newly
+started processes. When the shell extension is already loaded, `rcm log <level>`
+also pushes the change to it over the control pipe.
+
+* The `rcm` CLI writes `info`/`debug`/`trace` to **stdout** and
+  `warn`/`error` to **stderr**.
+* The DLL running inside Explorer has no console, so it appends to
+  `rcm.log` next to `rcm_com.dll` (size-capped and with duplicate messages
+  suppressed).
+
+For a one-off run you can override the stored level with the `RCM_LOG`
+environment variable:
+
+```bash
+RCM_LOG=debug rcm status
+```
 
 ## Listening
 
@@ -58,7 +102,7 @@ rcm start
 Right-click any file, folder, or empty space to see real-time output:
 
 ```
-[2026-05-26 10:30:15 UTC]
+INFO  [2026-05-26 10:30:15 UTC]
 Position: (1024, 768)
 Directory: C:\Users\Admin\Desktop
 Background: false
@@ -72,3 +116,6 @@ Selected Files:
   - C:\Users\Admin\Desktop\photo.jpg
 ---
 ```
+
+Run at `debug` level (`rcm log debug`) to also receive the full struct for each
+event.

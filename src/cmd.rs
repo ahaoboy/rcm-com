@@ -2,7 +2,7 @@ use crate::consts::*;
 use crate::error::{RcmError, Result};
 use std::fmt::Display;
 use std::path::PathBuf;
-use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
 use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Shell::*;
 use windows::core::PCWSTR;
@@ -10,15 +10,15 @@ use windows::core::PCWSTR;
 // ── helpers ────────────────────────────────────────────────────────────────
 
 /// Convert `&str` to a null-terminated wide string.
-fn to_wide(s: &str) -> Vec<u16> {
+pub(crate) fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// RAII wrapper that calls `RegCloseKey` on drop.
-struct RegKeyGuard(HKEY);
+pub(crate) struct RegKeyGuard(HKEY);
 
 impl RegKeyGuard {
-    fn new(key: HKEY) -> Self {
+    pub(crate) fn new(key: HKEY) -> Self {
         Self(key)
     }
 }
@@ -49,7 +49,7 @@ fn dll_path() -> Result<PathBuf> {
     Ok(dll)
 }
 
-fn set_reg_value(key: HKEY, name: Option<&str>, value: &str) -> Result<()> {
+pub(crate) fn set_reg_value(key: HKEY, name: Option<&str>, value: &str) -> Result<()> {
     let wide_val = to_wide(value);
     let name_wide: Option<Vec<u16>> = name.map(to_wide);
     let name_pcwstr = name_wide
@@ -73,7 +73,7 @@ fn set_reg_value(key: HKEY, name: Option<&str>, value: &str) -> Result<()> {
     }
 }
 
-fn create_key(parent: HKEY, subkey: &str) -> Result<HKEY> {
+pub(crate) fn create_key(parent: HKEY, subkey: &str) -> Result<HKEY> {
     let wide = to_wide(subkey);
     let mut key = HKEY::default();
     unsafe {
@@ -87,13 +87,23 @@ fn create_key(parent: HKEY, subkey: &str) -> Result<HKEY> {
 fn delete_key(parent: HKEY, subkey: &str) -> Result<()> {
     let wide = to_wide(subkey);
     unsafe {
-        RegDeleteTreeW(parent, PCWSTR(wide.as_ptr()))
-            .ok()
-            .map_err(|e| RcmError::Registry(format!("RegDeleteTreeW({subkey}) failed: {e}")))
+        let res = RegDeleteTreeW(parent, PCWSTR(wide.as_ptr()));
+        if res.is_ok() {
+            return Ok(());
+        }
+        // Idempotent: a missing key simply means it is already unregistered,
+        // so `unregister` completes cleanly even when run twice (or when only
+        // some of the handler keys were present).
+        if res == ERROR_FILE_NOT_FOUND || res == ERROR_PATH_NOT_FOUND {
+            return Ok(());
+        }
+        Err(RcmError::Registry(format!(
+            "RegDeleteTreeW({subkey}) failed: {res:?}"
+        )))
     }
 }
 
-fn open_key(parent: HKEY, subkey: &str) -> Result<HKEY> {
+pub(crate) fn open_key(parent: HKEY, subkey: &str) -> Result<HKEY> {
     let wide = to_wide(subkey);
     let mut key = HKEY::default();
     unsafe {
@@ -110,7 +120,7 @@ fn open_key(parent: HKEY, subkey: &str) -> Result<HKEY> {
     Ok(key)
 }
 
-fn get_reg_value(key: HKEY, name: Option<&str>) -> Result<String> {
+pub(crate) fn get_reg_value(key: HKEY, name: Option<&str>) -> Result<String> {
     let name_wide: Option<Vec<u16>> = name.map(to_wide);
     let name_pcwstr = name_wide
         .as_ref()
@@ -144,13 +154,38 @@ fn get_reg_value(key: HKEY, name: Option<&str>) -> Result<String> {
     }
 }
 
-fn get_handler_paths() -> Vec<String> {
-    vec![
-        format!("*\\shellex\\ContextMenuHandlers\\{HANDLER_NAME}"),
-        format!("lnkfile\\shellex\\ContextMenuHandlers\\{HANDLER_NAME}"),
-        format!("Directory\\shellex\\ContextMenuHandlers\\{HANDLER_NAME}"),
-        format!("Directory\\Background\\shellex\\ContextMenuHandlers\\{HANDLER_NAME}"),
-        format!("Drive\\shellex\\ContextMenuHandlers\\{HANDLER_NAME}"),
+/// A registry key the shell extension registers itself under.
+///
+/// [`handler_paths`] is the single source of truth shared by `register`,
+/// `unregister`, and `status`, so the three can never drift apart, and each key
+/// carries a label for human-readable reporting.
+struct HandlerKey {
+    label: &'static str,
+    path: String,
+}
+
+fn handler_paths() -> [HandlerKey; 5] {
+    [
+        HandlerKey {
+            label: "File (*)",
+            path: format!(r"*\shellex\ContextMenuHandlers\{HANDLER_NAME}"),
+        },
+        HandlerKey {
+            label: "Shortcut (lnkfile)",
+            path: format!(r"lnkfile\shellex\ContextMenuHandlers\{HANDLER_NAME}"),
+        },
+        HandlerKey {
+            label: "Directory",
+            path: format!(r"Directory\shellex\ContextMenuHandlers\{HANDLER_NAME}"),
+        },
+        HandlerKey {
+            label: "Directory Background",
+            path: format!(r"Directory\Background\shellex\ContextMenuHandlers\{HANDLER_NAME}"),
+        },
+        HandlerKey {
+            label: "Drive",
+            path: format!(r"Drive\shellex\ContextMenuHandlers\{HANDLER_NAME}"),
+        },
     ]
 }
 
@@ -158,9 +193,9 @@ pub fn register() -> Result<()> {
     let dll = dll_path()?;
     let dll_str = dll.to_string_lossy();
 
-    println!("Registering shell extension...");
-    println!("  CLSID: {CLSID_STR}");
-    println!("  DLL:   {dll_str}");
+    log::info!("Registering shell extension...");
+    log::info!("  CLSID: {CLSID_STR}");
+    log::info!("  DLL:   {dll_str}");
 
     // HKCR\CLSID\{GUID}
     let clsid_path = format!("CLSID\\{CLSID_STR}");
@@ -178,8 +213,8 @@ pub fn register() -> Result<()> {
     }
 
     // Context menu handler registrations
-    for path in get_handler_paths() {
-        let _key = RegKeyGuard::new(create_key(HKEY_CLASSES_ROOT, &path)?);
+    for handler in handler_paths() {
+        let _key = RegKeyGuard::new(create_key(HKEY_CLASSES_ROOT, &handler.path)?);
         set_reg_value(_key.0, None, CLSID_STR)?;
     }
 
@@ -195,16 +230,16 @@ pub fn register() -> Result<()> {
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
     }
 
-    println!("Registration successful. Restart Explorer to apply.");
+    log::info!("Registration successful. Restart Explorer to apply.");
     Ok(())
 }
 
 pub fn unregister() -> Result<()> {
-    println!("Unregistering shell extension...");
+    log::info!("Unregistering shell extension...");
 
     // Remove handler registrations
-    for path in get_handler_paths() {
-        delete_key(HKEY_CLASSES_ROOT, &path)?;
+    for handler in handler_paths() {
+        delete_key(HKEY_CLASSES_ROOT, &handler.path)?;
     }
 
     // Remove CLSID registration
@@ -225,8 +260,15 @@ pub fn unregister() -> Result<()> {
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
     }
 
-    println!("Unregistration successful. Restart Explorer to apply.");
+    log::info!("Unregistration successful. Restart Explorer to apply.");
     Ok(())
+}
+
+/// Result of checking one [`handler_paths`] registration key.
+pub struct HandlerStatus {
+    pub label: String,
+    pub path: String,
+    pub ok: bool,
 }
 
 pub struct Status {
@@ -236,11 +278,7 @@ pub struct Status {
     pub clsid_name: Option<String>,
     pub inproc_path: Option<String>,
     pub threading_model: Option<String>,
-    pub handler_star_ok: bool,
-    pub handler_lnkfile_ok: bool,
-    pub handler_directory_ok: bool,
-    pub handler_background_ok: bool,
-    pub handler_drive_ok: bool,
+    pub handlers: Vec<HandlerStatus>,
     pub is_approved: bool,
 }
 
@@ -249,11 +287,7 @@ impl Status {
         self.dll_path.is_some()
             && self.clsid_exists
             && self.inproc_path.is_some()
-            && self.handler_star_ok
-            && self.handler_lnkfile_ok
-            && self.handler_directory_ok
-            && self.handler_background_ok
-            && self.handler_drive_ok
+            && self.handlers.iter().all(|handler| handler.ok)
             && self.is_approved
     }
 }
@@ -290,20 +324,17 @@ impl Display for Status {
         }
 
         writeln!(f, "  Handlers:")?;
-        let print_handler = |f: &mut std::fmt::Formatter<'_>, ok: bool, path: &str| {
-            if ok {
-                writeln!(f, "    ✅ {path}")
+        for handler in &self.handlers {
+            if handler.ok {
+                writeln!(f, "    ✅ {} — {}", handler.label, handler.path)?;
             } else {
-                writeln!(f, "    ❌ {path} (Missing or Mismatch)")
+                writeln!(
+                    f,
+                    "    ❌ {} — {} (Missing or Mismatch)",
+                    handler.label, handler.path
+                )?;
             }
-        };
-
-        let paths = get_handler_paths();
-        print_handler(f, self.handler_star_ok, &paths[0])?;
-        print_handler(f, self.handler_lnkfile_ok, &paths[1])?;
-        print_handler(f, self.handler_directory_ok, &paths[2])?;
-        print_handler(f, self.handler_background_ok, &paths[3])?;
-        print_handler(f, self.handler_drive_ok, &paths[4])?;
+        }
 
         if self.is_approved {
             writeln!(f, "  ✅ Approved")?;
@@ -332,11 +363,7 @@ pub fn status() -> Result<Status> {
         clsid_name: None,
         inproc_path: None,
         threading_model: None,
-        handler_star_ok: false,
-        handler_lnkfile_ok: false,
-        handler_directory_ok: false,
-        handler_background_ok: false,
-        handler_drive_ok: false,
+        handlers: Vec::new(),
         is_approved: false,
     };
 
@@ -357,7 +384,6 @@ pub fn status() -> Result<Status> {
     }
 
     // Handlers
-    let handler_paths = get_handler_paths();
     let check_handler = |path: &str| -> bool {
         if let Ok(key) = open_key(HKEY_CLASSES_ROOT, path) {
             let _key = RegKeyGuard::new(key);
@@ -368,11 +394,14 @@ pub fn status() -> Result<Status> {
         }
     };
 
-    status.handler_star_ok = check_handler(&handler_paths[0]);
-    status.handler_lnkfile_ok = check_handler(&handler_paths[1]);
-    status.handler_directory_ok = check_handler(&handler_paths[2]);
-    status.handler_background_ok = check_handler(&handler_paths[3]);
-    status.handler_drive_ok = check_handler(&handler_paths[4]);
+    status.handlers = handler_paths()
+        .into_iter()
+        .map(|handler| HandlerStatus {
+            ok: check_handler(&handler.path),
+            label: handler.label.to_string(),
+            path: handler.path,
+        })
+        .collect();
 
     // Approved
     let approved_path = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Shell Extensions\\Approved";

@@ -1,9 +1,9 @@
 //! ContextMenuHandler — implements IShellExtInit + IContextMenu.
 //!
 //! Captures right-click context data from Explorer and sends it over a named
-//! pipe to the listening process. Always blocks the native context menu from
-//! appearing via a WH_CBT hook (Win10) and by returning E_FAIL from
-//! QueryContextMenu (Win11).
+//! pipe to the listening process. The native context menu is suppressed by a
+//! WH_CBT hook (Win10 TrackPopupMenu and the Win11 menu), which can be toggled
+//! at runtime with `rcm enable` / `rcm disable`.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -194,8 +194,10 @@ unsafe extern "system" fn handler_initialize(
 
         // Folder path from PIDL
         if !pidl_folder.is_null() {
-            let mut buf = [0u16; 260];
-            if SHGetPathFromIDListW(pidl_folder as *const _, &mut buf).as_bool() {
+            // 32768 is the maximum extended path length; the old fixed
+            // `[u16; 260]` buffer silently truncated long paths.
+            let mut buf = vec![0u16; 32_768];
+            if SHGetPathFromIDListEx(pidl_folder as *const _, &mut buf, GPFIDL_FLAGS(0)).as_bool() {
                 let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
                 info.dir = String::from_utf16_lossy(&buf[..len]);
             }
@@ -246,10 +248,10 @@ unsafe extern "system" fn handler_query_context_menu(
     unsafe {
         let handler = &*handler_from_menu_ptr(this);
         if let Ok(mut info) = handler.info.lock() {
-            // Determine event type from flags
-            if uflags & 0x00000001 != 0 {
+            // Determine event type from flags.
+            if uflags & CMF_DEFAULTONLY != 0 {
                 info.event = Event::Click { flags: uflags };
-            } else if uflags & 0x00000100 != 0 {
+            } else if uflags & CMF_EXTENDEDVERBS != 0 {
                 info.event = Event::Shift { flags: uflags };
             } else {
                 info.event = Event::Menu { flags: uflags };
@@ -259,37 +261,23 @@ unsafe extern "system" fn handler_query_context_menu(
             // registration and contain the resolved shortcut *target*,
             // not the .lnk file itself. The subsequent * handler call
             // (without CMF_VERBSONLY) will deliver the actual file path.
-            const CMF_VERBSONLY: u32 = 0x00000002;
-
             if uflags & CMF_VERBSONLY == 0 {
-                // Send the info over the named pipe to the listening process.
-                let send_result = (|| -> crate::error::Result<()> {
-                    let json_str = serde_json::to_string(&*info)?;
-                    let mut pipe = std::fs::OpenOptions::new()
-                        .write(true)
-                        .open(crate::consts::PIPE_NAME)?;
-                    std::io::Write::write_all(&mut pipe, json_str.as_bytes())?;
-                    Ok(())
-                })();
-
-                if let Err(err) = send_result {
-                    helpers::write_log(err);
+                // Hand the payload to the background sender so this COM
+                // callback (on the Explorer UI thread) never blocks on pipe
+                // I/O, even when the listener is busy or absent.
+                match serde_json::to_string(&*info) {
+                    Ok(json_str) => helpers::send_context(json_str),
+                    Err(err) => log::error!("failed to serialise context menu info: {err}"),
                 }
             }
         }
 
-        // Always block the native context menu — both Win10 and Win11.
-        // The CBT hook (installed during IShellExtInit::Initialize) intercepts
-        // TrackPopupMenu before any menu window is created. Returning E_FAIL
-        // tells the shell we contributed no items.
-        //
-        // When menu blocking is disabled, return S_OK (0 items) so the shell
-        // can display the native context menu normally.
-        if crate::control::is_enabled() {
-            E_FAIL
-        } else {
-            S_OK
-        }
+        // We contribute no menu items; the native menu is suppressed by the
+        // WH_CBT hook (see `hooks`). Returning `S_OK` is the documented way for
+        // a context-menu handler to report "I added nothing" — `E_FAIL` would
+        // be recorded as an extension failure by the shell and does not, by
+        // itself, hide the native menu.
+        S_OK
     }
 }
 
