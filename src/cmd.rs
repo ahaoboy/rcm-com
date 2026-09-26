@@ -1,5 +1,6 @@
 use crate::consts::*;
 use crate::error::{RcmError, Result};
+use crate::logging;
 use std::fmt::Display;
 use std::path::PathBuf;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
@@ -208,9 +209,9 @@ pub fn register() -> Result<()> {
     let dll = dll_path()?;
     let dll_str = dll.to_string_lossy();
 
-    log::info!("Registering shell extension...");
-    log::info!("  CLSID: {CLSID_STR}");
-    log::info!("  DLL:   {dll_str}");
+    logging::output("Registering shell extension...");
+    logging::output(format_args!("  CLSID: {CLSID_STR}"));
+    logging::output(format_args!("  DLL:   {dll_str}"));
 
     // HKCR\CLSID\{GUID}
     let clsid_path = format!("CLSID\\{CLSID_STR}");
@@ -245,12 +246,12 @@ pub fn register() -> Result<()> {
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
     }
 
-    log::info!("Registration successful. Restart Explorer to apply.");
+    logging::output("Registration successful. Restart Explorer to apply.");
     Ok(())
 }
 
 pub fn unregister() -> Result<()> {
-    log::info!("Unregistering shell extension...");
+    logging::output("Unregistering shell extension...");
 
     // Remove handler registrations
     for handler in handler_paths() {
@@ -275,7 +276,7 @@ pub fn unregister() -> Result<()> {
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
     }
 
-    log::info!("Unregistration successful. Restart Explorer to apply.");
+    logging::output("Unregistration successful. Restart Explorer to apply.");
     Ok(())
 }
 
@@ -284,6 +285,12 @@ pub struct HandlerStatus {
     pub label: String,
     pub path: String,
     pub ok: bool,
+    /// The value actually found, or `None` when the key/value is absent.
+    ///
+    /// Reported on mismatch: a stale or mistyped CLSID (e.g. a stray trailing
+    /// character) otherwise shows up only as "Mismatch", which says nothing
+    /// about what is wrong.
+    pub actual: Option<String>,
 }
 
 pub struct Status {
@@ -342,12 +349,20 @@ impl Display for Status {
         for handler in &self.handlers {
             if handler.ok {
                 writeln!(f, "    ✅ {} — {}", handler.label, handler.path)?;
-            } else {
-                writeln!(
-                    f,
-                    "    ❌ {} — {} (Missing or Mismatch)",
-                    handler.label, handler.path
-                )?;
+                continue;
+            }
+            writeln!(
+                f,
+                "    ❌ {} — {} (Missing or Mismatch)",
+                handler.label, handler.path
+            )?;
+            // Spell out the difference so the fix is obvious.
+            match &handler.actual {
+                Some(actual) => {
+                    writeln!(f, "         found:    {actual}")?;
+                    writeln!(f, "         expected: {CLSID_STR}")?;
+                }
+                None => writeln!(f, "         key or default value is absent")?,
             }
         }
 
@@ -399,22 +414,23 @@ pub fn status() -> Result<Status> {
     }
 
     // Handlers
-    let check_handler = |path: &str| -> bool {
-        if let Ok(key) = open_key(HKEY_CLASSES_ROOT, path) {
-            let _key = RegKeyGuard::new(key);
-            let val = get_reg_value(_key.0, None).unwrap_or_default();
-            val == CLSID_STR
-        } else {
-            false
-        }
+    let read_handler = |path: &str| -> Option<String> {
+        let key = open_key(HKEY_CLASSES_ROOT, path).ok()?;
+        let _guard = RegKeyGuard::new(key);
+        get_reg_value(key, None).ok()
     };
 
     status.handlers = handler_paths()
         .into_iter()
-        .map(|handler| HandlerStatus {
-            ok: check_handler(&handler.path),
-            label: handler.label.to_string(),
-            path: handler.path,
+        .map(|handler| {
+            let actual = read_handler(&handler.path);
+            let ok = actual.as_deref() == Some(CLSID_STR);
+            HandlerStatus {
+                ok,
+                actual,
+                label: handler.label.to_string(),
+                path: handler.path,
+            }
         })
         .collect();
 

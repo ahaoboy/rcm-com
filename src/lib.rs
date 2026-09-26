@@ -106,10 +106,12 @@ unsafe extern "system" fn cf_create_instance(
 ) -> HRESULT {
     unsafe {
         if ppv.is_null() {
+            crate::logging::log_load("CreateInstance: null output pointer");
             return E_POINTER;
         }
         *ppv = std::ptr::null_mut();
         if !punk_outer.is_null() {
+            crate::logging::log_load("CreateInstance: aggregation requested, which is unsupported");
             return CLASS_E_NOAGGREGATION;
         }
         // Initialise logging and start the control-pipe listener here (a
@@ -128,6 +130,11 @@ unsafe extern "system" fn cf_create_instance(
         // Release the initial reference since QI added one
         let release = vtbl.base.Release;
         release(ptr as *mut c_void);
+        if hr.is_err() {
+            crate::logging::log_load(format_args!(
+                "CreateInstance: QueryInterface({riid:?}) failed: {hr:?}"
+            ));
+        }
         hr
     }
 }
@@ -151,9 +158,11 @@ unsafe extern "system" fn DllMain(hinstance: HMODULE, reason: u32, _reserved: *m
         if reason == DLL_PROCESS_ATTACH {
             DLL_MODULE.store(hinstance.0 as usize, Ordering::Release);
             let _ = DisableThreadLibraryCalls(hinstance);
-            // NOTE: do NOT log, start threads, or touch the registry here.
-            // `DllMain` runs while the loader lock is held; logging and the
-            // pipe listeners are initialised lazily from COM activation.
+            // NOTE: deliberately no logging here. `DllMain` runs while the
+            // loader lock is held, and file I/O on this path can deadlock the
+            // process. Load-stage diagnostics are written from the COM entry
+            // points (`DllGetClassObject` / `CreateInstance`) via
+            // `logging::log_load`, which run after the lock is released.
         }
         1 // TRUE
     }
@@ -167,11 +176,15 @@ unsafe extern "system" fn DllGetClassObject(
 ) -> HRESULT {
     unsafe {
         if ppv.is_null() {
+            crate::logging::log_load("DllGetClassObject: null output pointer");
             return E_POINTER;
         }
         *ppv = std::ptr::null_mut();
 
         if *rclsid != CLSID_RCM {
+            crate::logging::log_load(format_args!(
+                "DllGetClassObject: unexpected CLSID {rclsid:?} (expected {CLSID_STR})"
+            ));
             return CLASS_E_CLASSNOTAVAILABLE;
         }
 
@@ -185,6 +198,11 @@ unsafe extern "system" fn DllGetClassObject(
         let hr = cf_query_interface(ptr, riid, ppv);
         // Release initial ref (QI already added one)
         cf_release(ptr);
+        if hr.is_err() {
+            crate::logging::log_load(format_args!(
+                "DllGetClassObject: QueryInterface({riid:?}) failed: {hr:?}"
+            ));
+        }
         hr
     }
 }

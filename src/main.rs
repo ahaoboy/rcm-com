@@ -124,20 +124,20 @@ fn handle_log(action: Option<LogAction>) -> Result<(), RcmError> {
     match action.unwrap_or(LogAction::Get) {
         LogAction::Get => match rcm_com::get_log_level() {
             Ok(level) => {
-                log::info!("log level: {level} (shell extension)");
+                logging::output(format_args!("log level: {level} (shell extension)"));
                 Ok(())
             }
             Err(_) => {
-                log::info!(
+                logging::output(format_args!(
                     "log level: {} (local; shell extension not running)",
                     logging::current_level()
-                );
+                ));
                 Ok(())
             }
         },
         LogAction::Set { level } => {
             logging::set_level(level)?;
-            log::info!("log level set to '{level}'");
+            logging::output(format_args!("log level set to '{level}'"));
             if !rcm_com::try_set_remote_log_level(level) {
                 log::warn!("shell extension not updated — the new level applies after it reloads");
             }
@@ -151,11 +151,11 @@ fn handle_client(action: Option<ClientAction>) -> Result<(), RcmError> {
     match action.unwrap_or(ClientAction::Get) {
         ClientAction::Get => match rcm_com::get_client() {
             Ok(Some(path)) => {
-                log::info!("{path}");
+                logging::output(path);
                 Ok(())
             }
             Ok(None) => {
-                log::info!("no program registered");
+                logging::output("no program registered");
                 Ok(())
             }
             Err(e) => Err(e),
@@ -163,7 +163,7 @@ fn handle_client(action: Option<ClientAction>) -> Result<(), RcmError> {
         ClientAction::Set { path } => {
             let path = resolve_path(path)?;
             rcm_com::set_client(path.clone())?;
-            log::info!("registered pipe user: {path}");
+            logging::output(format_args!("registered pipe user: {path}"));
             Ok(())
         }
     }
@@ -178,10 +178,10 @@ fn handle_shift(action: Option<ShiftAction>) -> Result<(), RcmError> {
     match action.unwrap_or(ShiftAction::Get) {
         ShiftAction::Get => match rcm_com::get_shift_bypass() {
             Ok(enabled) => {
-                log::info!(
+                logging::output(format_args!(
                     "Shift+right-click native menu: {} (shell extension)",
                     on_off(enabled)
-                );
+                ));
                 Ok(())
             }
             Err(e) => {
@@ -192,10 +192,10 @@ fn handle_shift(action: Option<ShiftAction>) -> Result<(), RcmError> {
         ShiftAction::Set { state } => {
             let enabled = bool::from(state);
             rcm_com::set_shift_bypass(enabled)?;
-            log::info!(
+            logging::output(format_args!(
                 "Shift+right-click native menu set to '{}' (this session only)",
                 on_off(enabled)
-            );
+            ));
             Ok(())
         }
     }
@@ -237,13 +237,15 @@ async fn main() {
         Commands::Install => cmd::register(),
         Commands::Uninstall => cmd::unregister(),
         Commands::Start => listen(|info| {
-            // Human-readable summary on `info`, full struct on `debug`.
-            log::info!("{info}");
+            // The event stream is the purpose of `start`, so it is result
+            // output and unaffected by the log level. The full struct stays a
+            // `debug` diagnostic.
+            logging::output(&info);
             log::debug!("{info:#?}");
         })
         .await,
         Commands::Status => cmd::status().map(|s| {
-            log::info!("{s}");
+            logging::output(&s);
         }),
         Commands::Menu { action } => match action {
             Some(MenuAction::Win10) => MenuStyle::Classic.set().map_err(RcmError::from),
@@ -256,8 +258,11 @@ async fn main() {
             .map_err(RcmError::from),
             None => {
                 let style = MenuStyle::current();
-                log::info!("Menu style:      {style}");
-                log::info!("Default classic: {}", matches!(style, MenuStyle::Classic));
+                logging::output(format_args!("Menu style:      {style}"));
+                logging::output(format_args!(
+                    "Default classic: {}",
+                    matches!(style, MenuStyle::Classic)
+                ));
                 Ok(())
             }
         },
@@ -265,17 +270,17 @@ async fn main() {
             restart_explorer(std::time::Duration::from_secs(5)).map_err(RcmError::from)
         }
         Commands::Enable => rcm_com::enable().map(|_| {
-            log::info!("Menu blocking ENABLED — native context menu will be hidden.");
+            logging::output("Menu blocking ENABLED — native context menu will be hidden.");
         }),
         Commands::Disable => rcm_com::disable().map(|_| {
-            log::info!("Menu blocking DISABLED — native context menu will be shown.");
+            logging::output("Menu blocking DISABLED — native context menu will be shown.");
         }),
         Commands::Query => match rcm_com::query() {
             Ok(enabled) => {
-                log::info!(
+                logging::output(format_args!(
                     "Menu blocking: {}",
                     if enabled { "ENABLED" } else { "DISABLED" }
-                );
+                ));
                 Ok(())
             }
             Err(e) => Err(e),

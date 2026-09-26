@@ -1,20 +1,38 @@
 //! Unified logging built on the [`log`] facade.
 //!
-//! Every message the program produces — CLI results, diagnostics, and DLL
-//! logs — goes through `log`, so a single level controls all output.
+//! This module is the **single** place that writes output — no other module
+//! touches stdout, stderr, or the log file. Three channels cover every case:
 //!
-//! The backend is [`RcmLogger`], which writes to one of two targets:
+//! | Channel | Purpose | Level-controlled? |
+//! |---|---|---|
+//! | [`output`] | Command results: status reports, queried values, captured events | **No** — always printed |
+//! | `log::{info,warn,error,debug,…}` | Diagnostics: progress notes, warnings, failures | Yes |
+//! | [`log_load`] | DLL load-stage diagnostics, before the backend exists | **No** — always recorded |
 //!
-//! * **Console** (`rcm` CLI): `info`/`debug`/`trace` go to stdout, while
-//!   `warn`/`error` go to stderr — the conventional split that keeps data on
+//! Results and diagnostics are deliberately separate: `rcm log set off` must not
+//! make `rcm status` print nothing and still exit `0`. Use `log::*` for anything
+//! a user could reasonably want silenced, and [`output`] for the payload they
+//! asked for.
+//!
+//! # Targets
+//!
+//! * **Console** (`rcm` CLI): diagnostics go to stdout for `info` and below, and
+//!   to stderr for `warn`/`error` — the conventional split that keeps data on
 //!   stdout and diagnostics on stderr.
-//! * **File** (`rcm_com.dll` inside Explorer, where no console exists):
-//!   appended to `rcm.log` next to the DLL, with a size cap and duplicate
-//!   suppression so a misbehaving listener cannot grow it without bound.
+//! * **File** (`rcm_com.dll` inside Explorer, where no console exists): records
+//!   are appended to `rcm.log` next to the DLL, with duplicate suppression and a
+//!   **hard 1 MiB cap** (see [`LOG_MAX_BYTES`]).
 //!
 //! The active level is persisted under `HKCU\Software\RcmCom\LogLevel` so that
 //! `rcm log <level>` survives across processes. A running DLL additionally
-//! receives the new level over the control pipe (see [`crate::control`]).
+//! receives the new level over the pipe (see [`crate::control`]).
+//!
+//! # Load-stage diagnostics
+//!
+//! Failures while the shell loads the DLL happen *before* the logger exists
+//! (or because it could not be set up), and they are what you most need
+//! evidence for. [`log_load`] therefore writes straight to the log file and
+//! ignores the configured level. It must never be called from `DllMain`.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -38,10 +56,104 @@ const LOG_LEVEL_VALUE: &str = CONFIG_LOG_LEVEL;
 /// Level used when nothing has been configured.
 const DEFAULT_LEVEL: LogLevel = LogLevel::Info;
 
-/// Maximum size of the DLL log file before it is truncated.
+/// Hard upper bound for the log file. It is never exceeded: room is reserved
+/// before writing, so a record cannot push the file past this size.
 const LOG_MAX_BYTES: u64 = 1024 * 1024;
+/// Headroom kept free for the notice written when the log resets. Subtracting
+/// it makes the bound provable: after a reset the file is at most
+/// `notice + record` = `LOG_RESERVE + (LOG_MAX_BYTES - LOG_RESERVE)`.
+const LOG_RESET_RESERVE: u64 = 256;
+/// Largest record accepted, leaving room for a reset notice in the same file.
+const LOG_MAX_RECORD_BYTES: u64 = LOG_MAX_BYTES - LOG_RESET_RESERVE;
 /// Window during which an identical message is suppressed in the log file.
 const LOG_DEDUP_WINDOW: Duration = Duration::from_secs(5);
+
+/// File name of the DLL log.
+const LOG_FILE_NAME: &str = "rcm.log";
+
+// =============================================================================
+// Log file location
+// =============================================================================
+
+/// Resolved log file path, computed once per process.
+static LOG_FILE: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Resolve (once) the log file path: `rcm.log` next to the DLL.
+///
+/// The file is always kept with the DLL, so a single known location holds all
+/// diagnostics. Returns `None` when the DLL directory itself cannot be
+/// resolved, in which case file logging is unavailable.
+fn log_file_path() -> Option<&'static PathBuf> {
+    LOG_FILE
+        .get_or_init(|| crate::helpers::dll_dir().map(|dir| dir.join(LOG_FILE_NAME)))
+        .as_ref()
+}
+
+/// Append one already-formatted record, keeping the file within
+/// [`LOG_MAX_BYTES`].
+///
+/// Size is reserved *before* writing. The previous implementation only checked
+/// the size already on disk, so a record could push the file past the cap —
+/// and a large one (a debug dump naming many files) could overshoot it by a lot.
+///
+/// When the cap is reached the file is restarted with a notice explaining that
+/// older entries were dropped, so a reader is never misled by a silent gap.
+fn append_line(path: &Path, line: &str) {
+    // A record that could never fit even in an empty file is replaced by a short
+    // notice, so pathological input cannot defeat the cap.
+    let record = if line.len() as u64 + 1 > LOG_MAX_RECORD_BYTES {
+        format!(
+            "[{}] WARN  oversized log record discarded ({} bytes)",
+            crate::helpers::timestamp(),
+            line.len()
+        )
+    } else {
+        line.to_owned()
+    };
+    let needed = record.len() as u64 + 1;
+
+    // Reserve space up front so the write below cannot exceed the cap.
+    if std::fs::metadata(path).is_ok_and(|meta| meta.len() + needed > LOG_MAX_RECORD_BYTES)
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+    {
+        let _ = writeln!(
+            file,
+            "[{}] WARN  log reached its {LOG_MAX_BYTES}-byte cap; older entries were dropped",
+            crate::helpers::timestamp()
+        );
+    }
+
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{record}");
+    }
+}
+
+/// Record a DLL load-stage message directly to the log file.
+///
+/// Deliberately bypasses the [`log`] facade: load failures happen before the
+/// logger is installed — or because it could not be installed — and they are
+/// recorded even when the level is `off`, since a DLL that fails to load is
+/// exactly when the evidence matters most.
+///
+/// Must **not** be called from `DllMain`: file I/O while the loader lock is
+/// held can deadlock the process. Call it from COM entry points instead.
+pub fn log_load(message: impl std::fmt::Display) {
+    let Some(path) = log_file_path() else {
+        return;
+    };
+    append_line(
+        path,
+        &format!("[{}] LOAD  {message}", crate::helpers::timestamp()),
+    );
+}
 
 // =============================================================================
 // LogLevel
@@ -234,28 +346,15 @@ impl RcmLogger {
         }
 
         // Truncate once the file grows past the cap so disk usage is bounded.
-        if let Ok(meta) = std::fs::metadata(path)
-            && meta.len() > LOG_MAX_BYTES
-        {
-            let _ = std::fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open(path);
-        }
-
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let _ = writeln!(
-                file,
+        append_line(
+            path,
+            &format!(
                 "[{}] {:<5} {}",
                 crate::helpers::timestamp(),
                 record.level(),
                 message
-            );
-        }
+            ),
+        );
     }
 }
 
@@ -286,6 +385,8 @@ impl Log for RcmLogger {
 
 static INIT: OnceLock<()> = OnceLock::new();
 static LOGGER: OnceLock<&'static RcmLogger> = OnceLock::new();
+/// Guards the one-time "DLL loaded" record (it must not repeat per right-click).
+static LOAD_LOGGED: OnceLock<()> = OnceLock::new();
 
 /// The level currently in effect, independent of whether a logger has been
 /// installed yet.
@@ -328,6 +429,8 @@ fn init(target: Target) {
             // `set_logger` does not touch the global max level (which defaults
             // to `Off`), so it must be set explicitly or nothing is emitted.
             log::set_max_level(level.to_filter());
+        } else {
+            log_load("failed to install the log backend (a logger was already set)");
         }
     });
 }
@@ -341,14 +444,25 @@ pub fn init_console() {
 
 /// Initialise logging for the DLL running inside Explorer (writes to a file).
 ///
-/// Falls back to the console target if the DLL directory cannot be resolved.
+/// Uses the same path as [`log_load`] (`rcm.log` next to the DLL) so load
+/// diagnostics and runtime logs always land in one file. Falls back to the
+/// console target only when the DLL directory cannot be resolved.
+///
 /// Must be called *after* the loader lock is released (i.e. from COM
 /// activation, never from `DllMain`).
 pub fn init_dll() {
-    match crate::helpers::dll_dir() {
-        Some(dir) => init(Target::File(dir.join("rcm.log"))),
+    match log_file_path() {
+        Some(path) => init(Target::File(path.clone())),
         None => init(Target::Console),
     }
+    // Record the successful load once per process — `init_dll` runs on every
+    // COM activation, which happens once per right-click.
+    LOAD_LOGGED.get_or_init(|| {
+        log_load(format_args!(
+            "rcm_com.dll loaded into process {}",
+            std::process::id()
+        ));
+    });
 }
 
 // =============================================================================
@@ -367,6 +481,16 @@ pub fn current_level() -> LogLevel {
 pub(crate) fn apply_level(level: LogLevel) {
     ACTIVE_LEVEL.store(level.to_u8(), Ordering::Relaxed);
     log::set_max_level(level.to_filter());
+}
+
+/// Write a command **result** to stdout, unconditionally.
+///
+/// Results — a status report, a queried value, a captured event — are the
+/// program's primary output, not diagnostics, so they deliberately ignore the
+/// log level: `rcm log set off` must not make `rcm status` silently print
+/// nothing and still exit `0`. Use `log::*` for diagnostics instead.
+pub fn output(message: impl std::fmt::Display) {
+    let _ = writeln!(std::io::stdout(), "{message}");
 }
 
 /// Set the level for this process and persist it for future processes.

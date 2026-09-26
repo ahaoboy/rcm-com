@@ -217,8 +217,8 @@ setting if the extension is not running.
 * The `rcm` CLI writes `info`/`debug`/`trace` to **stdout** and
   `warn`/`error` to **stderr**.
 * The DLL running inside Explorer has no console, so it appends to
-  `rcm.log` next to `rcm_com.dll` (size-capped and with duplicate messages
-  suppressed).
+  `rcm.log` next to `rcm_com.dll` (hard-capped at 1 MiB, oldest entries
+  dropped with a notice; duplicate messages within 5 s are suppressed).
 
 For a one-off run you can override the stored level with the `RCM_LOG`
 environment variable:
