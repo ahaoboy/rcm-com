@@ -1,44 +1,22 @@
-//! Menu-blocking toggle — global `AtomicBool` + tokio control pipe.
+//! Menu-blocking state and the public control API.
 //!
-//! A background thread listens on `\\.\pipe\rcm_com_control`.  External
-//! programs send JSON commands like `{"command":"disable"}` over this pipe to
-//! toggle the global flag.  The thread is started lazily from COM activation
-//! (see `cf_create_instance`) — never from `DllMain`, which runs under the
-//! loader lock.
+//! The state itself is a process-global atomic; all transport goes through
+//! [`crate::pipe`], which hosts the single duplex named pipe shared with the
+//! `rcm` CLI — there is no longer a separate control pipe.
 //!
 //! The CBT hook and `QueryContextMenu` consult [`is_enabled`] before
 //! intercepting the native menu.
 //!
-//! Public API: [`enable`], [`disable`], [`query`], [`start`], and
-//! [`try_set_remote_log_level`].
+//! Public API: [`enable`], [`disable`], [`query`], [`start`],
+//! [`get_log_level`], [`set_log_level`], [`try_set_remote_log_level`],
+//! [`get_client`], and [`set_client`].
 
-use serde::{Deserialize, Serialize};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
 use std::time::Duration;
 
-use crate::consts::CONTROL_PIPE_NAME;
-use crate::error::Result;
-
-// =============================================================================
-// Control commands (extensible via serde tagged enum)
-// =============================================================================
-
-/// A command sent over the control pipe.
-///
-/// Serialised as JSON with a `"command"` tag, e.g. `{"command":"enable"}`.
-/// Add new variants here to extend the control protocol.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "command", rename_all = "lowercase")]
-enum ControlCommand {
-    Enable,
-    Disable,
-    /// Query the current blocking state — the server replies with `true`/`false`.
-    Query,
-    /// Change the log level of the running DLL, e.g. `{"command":"log","level":"debug"}`.
-    Log { level: String },
-}
+use crate::error::{RcmError, Result};
+use crate::logging::LogLevel;
+use crate::pipe::{self, Request, Response};
 
 // =============================================================================
 // Global state
@@ -48,110 +26,33 @@ enum ControlCommand {
 /// `false` = let the system menu appear normally.
 static MENU_BLOCKING_ENABLED: AtomicBool = AtomicBool::new(true);
 
-/// Ensures the control-pipe listener thread is spawned exactly once per process.
-static LISTENER_STARTED: OnceLock<()> = OnceLock::new();
+/// Timeout for one-shot control commands (`enable` / `disable` / `query`).
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Short timeout for best-effort notifications such as pushing a log level.
+const NOTIFY_TIMEOUT: Duration = Duration::from_millis(200);
 
 // =============================================================================
-// DLL-internal check (crate-private)
+// DLL-internal state
 // =============================================================================
 
-/// Ensure the control-pipe listener thread is running.
+/// Ensure the pipe server is running.
 ///
-/// Called from `cf_create_instance` (a normal COM activation thread) so the
-/// control pipe exists as soon as the shell instantiates the handler.
-/// Idempotent — the listener is spawned at most once per process.
+/// Called from `cf_create_instance` (a normal COM activation thread), never
+/// from `DllMain`, which runs under the loader lock. Idempotent.
 pub fn start() {
-    LISTENER_STARTED.get_or_init(|| {
-        thread::spawn(run_control_listener);
-    });
+    pipe::start_server();
 }
 
 /// Check whether menu blocking is currently enabled.
 ///
 /// Called from the CBT hook and `QueryContextMenu` on every right-click.
-/// The listener is already started by [`start`] during DLL load, so no lazy
-/// spawn is needed here.
 pub fn is_enabled() -> bool {
     MENU_BLOCKING_ENABLED.load(Ordering::Relaxed)
 }
 
-// =============================================================================
-// Background pipe-listener thread (tokio)
-// =============================================================================
-
-/// Run in a dedicated thread: create a named-pipe server, wait for clients,
-/// and update [`MENU_BLOCKING_ENABLED`] according to received commands.
-///
-/// The pipe is destroyed and recreated between connections because tokio's
-/// `NamedPipeServer` does not expose `DisconnectNamedPipe`.  A 500 ms sleep
-/// after drop gives the Windows kernel time to release the pipe name before
-/// the next `create()` call — the DLL is only loaded once per Explorer
-/// process so there is no contention from other instances.
-fn run_control_listener() {
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(_) => return,
-    };
-
-    rt.block_on(async {
-        loop {
-            // Restrict the control pipe to the current user and Local System so
-            // other local processes cannot toggle menu blocking.
-            let mut security = crate::helpers::PipeSecurity::new();
-            // Safety: `security` owns a valid SECURITY_ATTRIBUTES (or a null
-            // descriptor on fallback) that outlives this call.
-            let created = unsafe {
-                tokio::net::windows::named_pipe::ServerOptions::new()
-                    .create_with_security_attributes_raw(CONTROL_PIPE_NAME, security.as_ptr())
-            };
-            let mut server = match created {
-                Ok(s) => s,
-                Err(_) => {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    continue;
-                }
-            };
-
-            if server.connect().await.is_err() {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                continue;
-            }
-
-            // Read a single command. A bounded read is used instead of
-            // read_to_end so the server does not wait for the client to close
-            // its write end — Query clients keep the connection open to read
-            // the response back.
-            let mut buf = [0u8; 64];
-            let n = tokio::io::AsyncReadExt::read(&mut server, &mut buf).await;
-            let Ok(n) = n else { continue };
-            if n == 0 {
-                continue;
-            }
-            if let Ok(cmd) = serde_json::from_slice::<ControlCommand>(&buf[..n]) {
-                match cmd {
-                    ControlCommand::Enable => MENU_BLOCKING_ENABLED.store(true, Ordering::Relaxed),
-                    ControlCommand::Disable => {
-                        MENU_BLOCKING_ENABLED.store(false, Ordering::Relaxed)
-                    }
-                    ControlCommand::Query => {
-                        let state = MENU_BLOCKING_ENABLED.load(Ordering::Relaxed);
-                        use tokio::io::AsyncWriteExt;
-                        let _ = server
-                            .write_all(serde_json::to_vec(&state).unwrap_or_default().as_slice())
-                            .await;
-                    }
-                    ControlCommand::Log { level } => {
-                        if let Some(filter) = crate::logging::parse_level(&level) {
-                            crate::logging::apply_level(filter);
-                        }
-                    }
-                }
-            }
-        }
-    });
+/// Update the blocking state (called by the pipe server for `enable`/`disable`).
+pub(crate) fn set_enabled(enabled: bool) {
+    MENU_BLOCKING_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
 // =============================================================================
@@ -159,98 +60,83 @@ fn run_control_listener() {
 // =============================================================================
 
 /// Enable context-menu blocking (the default).
-///
-/// Sends `{"command":"enable"}` over the control named pipe.
-/// The DLL must be loaded (right-click once in Explorer) for the pipe to exist.
-pub fn enable() -> Result<()> {
-    send_control(&ControlCommand::Enable)
+pub async fn enable() -> Result<()> {
+    expect_ok(Request::Enable).await
 }
 
 /// Disable context-menu blocking.
-///
-/// Sends `{"command":"disable"}` over the control named pipe.
-pub fn disable() -> Result<()> {
-    send_control(&ControlCommand::Disable)
+pub async fn disable() -> Result<()> {
+    expect_ok(Request::Disable).await
 }
 
 /// Query whether context-menu blocking is currently enabled.
 ///
-/// Sends `{"command":"query"}` over the control named pipe and reads the
-/// current state back from the DLL, so callers always get the *real* state
+/// Reads the state back from the DLL, so callers always get the *real* state
 /// (unlike [`is_enabled`], which only reads this process's local copy).
-pub fn query() -> Result<bool> {
-    let cmd = serde_json::to_vec(&ControlCommand::Query)?;
-    let max_attempts = 30;
-    for _ in 0..max_attempts {
-        match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(CONTROL_PIPE_NAME)
-        {
-            Ok(mut pipe) => {
-                std::io::Write::write_all(&mut pipe, &cmd)?;
-                let mut buf = Vec::new();
-                std::io::Read::read_to_end(&mut pipe, &mut buf)?;
-                return serde_json::from_slice::<bool>(&buf).map_err(Into::into);
-            }
-            Err(_) => {
-                thread::sleep(Duration::from_millis(100));
-            }
-        }
+pub async fn query() -> Result<bool> {
+    match pipe::request(&Request::Query, CLIENT_TIMEOUT).await? {
+        Response::State { enabled } => Ok(enabled),
+        other => Err(unexpected(other)),
     }
-    Err(crate::error::RcmError::Environment(format!(
-        "Control pipe not available after {max_attempts} attempts — \
-         right-click in Explorer first to load the DLL"
-    )))
+}
+
+/// Register `path` as the program currently using the pipe.
+pub async fn set_client(path: String) -> Result<()> {
+    expect_ok(Request::SetClient { path }).await
+}
+
+/// Query the absolute path of the program registered as using the pipe.
+///
+/// Returns `None` when nothing has been registered yet.
+pub async fn get_client() -> Result<Option<String>> {
+    match pipe::request(&Request::GetClient, CLIENT_TIMEOUT).await? {
+        Response::Client { path } => Ok(path),
+        other => Err(unexpected(other)),
+    }
+}
+
+/// Query the log level of the running DLL.
+pub async fn get_log_level() -> Result<LogLevel> {
+    match pipe::request(&Request::GetLog, CLIENT_TIMEOUT).await? {
+        Response::LogLevel { level } => Ok(level),
+        other => Err(unexpected(other)),
+    }
+}
+
+/// Change the log level of a running DLL.
+///
+/// Returns an error when the shell extension is not currently loaded; use
+/// [`try_set_remote_log_level`] for a best-effort variant.
+pub async fn set_log_level(level: LogLevel) -> Result<()> {
+    expect_ok(Request::SetLog { level }).await
 }
 
 /// Best-effort request to change the log level of a running DLL.
 ///
-/// Writes a single command without retrying — used by `rcm log`, where the
-/// 3-second retry of [`send_control`] would be a poor experience when the shell
-/// extension is not currently loaded. Returns `true` if the command was sent.
-pub fn try_set_remote_log_level(level: &str) -> bool {
-    let Ok(json) = serde_json::to_vec(&ControlCommand::Log {
-        level: level.to_string(),
-    }) else {
-        return false;
-    };
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .open(CONTROL_PIPE_NAME)
-    {
-        Ok(mut pipe) => std::io::Write::write_all(&mut pipe, &json).is_ok(),
-        Err(_) => false,
-    }
+/// Returns `false` when the shell extension is not currently loaded, so the
+/// caller can report that the new level applies only after it reloads.
+pub async fn try_set_remote_log_level(level: LogLevel) -> bool {
+    matches!(
+        pipe::request(&Request::SetLog { level }, NOTIFY_TIMEOUT).await,
+        Ok(Response::Ok)
+    )
 }
 
 // =============================================================================
-// Pipe client
+// Helpers
 // =============================================================================
 
-/// Serialise a [`ControlCommand`] to JSON and send it over the control pipe.
-///
-/// Retries for up to 3 seconds — the pipe server sleeps 500 ms between
-/// recreations, so 30 × 100 ms covers that window.
-fn send_control(cmd: &ControlCommand) -> Result<()> {
-    let json = serde_json::to_vec(cmd)?;
-    let max_attempts = 30;
-    for _ in 0..max_attempts {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .open(CONTROL_PIPE_NAME)
-        {
-            Ok(mut pipe) => {
-                std::io::Write::write_all(&mut pipe, &json)?;
-                return Ok(());
-            }
-            Err(_) => {
-                thread::sleep(Duration::from_millis(100));
-            }
-        }
+/// Send a request that answers with a plain acknowledgement.
+async fn expect_ok(request: Request) -> Result<()> {
+    match pipe::request(&request, CLIENT_TIMEOUT).await? {
+        Response::Ok => Ok(()),
+        Response::Error { message } => Err(RcmError::Environment(message)),
+        other => Err(unexpected(other)),
     }
-    Err(crate::error::RcmError::Environment(format!(
-        "Control pipe not available after {max_attempts} attempts — \
-         right-click in Explorer first to load the DLL"
-    )))
+}
+
+fn unexpected(response: Response) -> RcmError {
+    RcmError::Environment(format!(
+        "unexpected response from the shell extension: {response:?}"
+    ))
 }

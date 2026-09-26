@@ -12,11 +12,16 @@ pub(crate) mod com;
 pub(crate) mod control;
 pub(crate) mod helpers;
 pub(crate) mod hooks;
+pub(crate) mod pipe;
 pub(crate) mod types;
 
 // ── public re-exports ────────────────────────────────────────────────────
 pub use consts::PIPE_NAME;
-pub use control::{disable, enable, is_enabled, query, start, try_set_remote_log_level};
+pub use control::{
+    disable, enable, get_client, get_log_level, is_enabled, query, set_client, set_log_level,
+    start, try_set_remote_log_level,
+};
+pub use logging::LogLevel;
 pub use types::{ContextMenuInfo, Event};
 
 use std::ffi::c_void;
@@ -187,7 +192,7 @@ unsafe extern "system" fn DllGetClassObject(
 extern "system" fn DllCanUnloadNow() -> HRESULT {
     if helpers::DLL_REF_COUNT.load(Ordering::Relaxed) == 0
         && !hooks::has_active_cbt_hooks()
-        && !helpers::sender_active()
+        && !pipe::server_active()
     {
         S_OK
     } else {

@@ -247,7 +247,11 @@ unsafe extern "system" fn handler_query_context_menu(
 ) -> HRESULT {
     unsafe {
         let handler = &*handler_from_menu_ptr(this);
-        if let Ok(mut info) = handler.info.lock() {
+
+        // Take the payload out of the handler while the lock is held, then
+        // broadcast outside the lock: the pipe server only does non-blocking
+        // sends, so the Explorer UI thread never waits on I/O.
+        let event = if let Ok(mut info) = handler.info.lock() {
             // Determine event type from flags.
             if uflags & CMF_DEFAULTONLY != 0 {
                 info.event = Event::Click { flags: uflags };
@@ -262,14 +266,16 @@ unsafe extern "system" fn handler_query_context_menu(
             // not the .lnk file itself. The subsequent * handler call
             // (without CMF_VERBSONLY) will deliver the actual file path.
             if uflags & CMF_VERBSONLY == 0 {
-                // Hand the payload to the background sender so this COM
-                // callback (on the Explorer UI thread) never blocks on pipe
-                // I/O, even when the listener is busy or absent.
-                match serde_json::to_string(&*info) {
-                    Ok(json_str) => helpers::send_context(json_str),
-                    Err(err) => log::error!("failed to serialise context menu info: {err}"),
-                }
+                Some(std::mem::take(&mut *info))
+            } else {
+                None
             }
+        } else {
+            None
+        };
+
+        if let Some(event) = event {
+            crate::pipe::broadcast_event(event);
         }
 
         // We contribute no menu items; the native menu is suppressed by the

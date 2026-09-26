@@ -51,10 +51,26 @@ rcm restart-explorer
 | `rcm enable` | Block (hide) the native context menu — the default |
 | `rcm disable` | Stop blocking — let the native context menu appear |
 | `rcm query` | Print whether menu blocking is currently enabled |
-| `rcm log [level]` | Show or set the log level (see [Logging](#logging)) |
+| `rcm log get` | Query the log level of the running shell extension |
+| `rcm log set <level>` | Set the log level (see [Logging](#logging)) |
+| `rcm client get` | Show which program is registered as using the pipe |
+| `rcm client set [path]` | Register a program path (defaults to this executable) |
 
 Every command exits `0` on success and `1` on failure, so scripts and CI can
 detect errors.
+
+## Pipe client registration
+
+The extension records which program is using the pipe:
+
+```bash
+rcm client get                 # print the registered absolute path
+rcm client set                 # register this executable
+rcm client set C:\tools\app.exe  # register a specific program
+```
+
+`rcm start` registers its own executable automatically when it subscribes, so
+`rcm client get` normally reports the running listener.
 
 ## Logging
 
@@ -71,14 +87,14 @@ the [`log`](https://docs.rs/log) facade and controlled by a single level:
 | `trace` | Everything |
 
 ```bash
-rcm log info      # set the level (persisted for future runs)
-rcm log           # print the current level
-rcm log debug     # include the full struct dumped by `rcm start`
+rcm log get        # ask the running extension for its live level
+rcm log set debug  # set it (persisted, and pushed to the extension)
 ```
 
 The level is stored under `HKCU\Software\RcmCom\LogLevel` and applied to newly
-started processes. When the shell extension is already loaded, `rcm log <level>`
-also pushes the change to it over the control pipe.
+started processes. When the shell extension is already loaded, `rcm log set`
+also pushes the change to it over the pipe; `rcm log get` reports the local
+setting if the extension is not running.
 
 * The `rcm` CLI writes `info`/`debug`/`trace` to **stdout** and
   `warn`/`error` to **stderr**.
@@ -99,6 +115,13 @@ RCM_LOG=debug rcm status
 rcm start
 ```
 
+All CLI ↔ extension traffic uses a **single duplex named pipe**
+(`\\.\pipe\rcm_com`), with the shell extension as the server and the CLI as the
+client. Because the extension hosts the pipe, `rcm enable` / `rcm disable` /
+`rcm query` / `rcm log` / `rcm client` all work on their own — `rcm start` does
+not need to be running, the extension just has to be loaded (right-click once).
+
+`rcm start` waits for the extension and then prints each event as it happens.
 Right-click any file, folder, or empty space to see real-time output:
 
 ```
@@ -117,5 +140,5 @@ Selected Files:
 ---
 ```
 
-Run at `debug` level (`rcm log debug`) to also receive the full struct for each
-event.
+Run at `debug` level (`rcm log set debug`) to also receive the full struct for
+each event.

@@ -20,11 +20,13 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
+use serde::{Deserialize, Serialize};
 use windows::Win32::System::Registry::HKEY_CURRENT_USER;
 
 use crate::cmd::{RegKeyGuard, create_key, get_reg_value, open_key, set_reg_value};
@@ -36,7 +38,7 @@ const CONFIG_KEY: &str = r"Software\RcmCom";
 const LOG_LEVEL_VALUE: &str = "LogLevel";
 
 /// Level used when nothing has been configured.
-const DEFAULT_LEVEL: LevelFilter = LevelFilter::Info;
+const DEFAULT_LEVEL: LogLevel = LogLevel::Info;
 
 /// Maximum size of the DLL log file before it is truncated.
 const LOG_MAX_BYTES: u64 = 1024 * 1024;
@@ -44,57 +46,122 @@ const LOG_MAX_BYTES: u64 = 1024 * 1024;
 const LOG_DEDUP_WINDOW: Duration = Duration::from_secs(5);
 
 // =============================================================================
-// Level <-> string / integer conversion
+// LogLevel
 // =============================================================================
 
-/// Serialise a [`LevelFilter`] to the compact integer stored atomically.
-const fn filter_to_u8(filter: LevelFilter) -> u8 {
-    match filter {
-        LevelFilter::Off => 0,
-        LevelFilter::Error => 1,
-        LevelFilter::Warn => 2,
-        LevelFilter::Info => 3,
-        LevelFilter::Debug => 4,
-        LevelFilter::Trace => 5,
-    }
-}
-
-/// Inverse of [`filter_to_u8`].
-const fn u8_to_filter(value: u8) -> LevelFilter {
-    match value {
-        0 => LevelFilter::Off,
-        1 => LevelFilter::Error,
-        2 => LevelFilter::Warn,
-        3 => LevelFilter::Info,
-        4 => LevelFilter::Debug,
-        _ => LevelFilter::Trace,
-    }
-}
-
-/// Parse a level name (`off`, `error`, `warn`, `info`, `debug`, `trace`).
+/// A log level, shared by the CLI, the persisted setting, and the pipe
+/// protocol.
 ///
-/// Case-insensitive; `warning` is accepted as an alias for `warn`.
-pub fn parse_level(s: &str) -> Option<LevelFilter> {
-    Some(match s.trim().to_ascii_lowercase().as_str() {
-        "off" | "none" => LevelFilter::Off,
-        "error" => LevelFilter::Error,
-        "warn" | "warning" => LevelFilter::Warn,
-        "info" => LevelFilter::Info,
-        "debug" => LevelFilter::Debug,
-        "trace" => LevelFilter::Trace,
-        _ => return None,
-    })
+/// Using an enum instead of a string means an invalid level cannot be
+/// constructed: the compiler and the deserialiser both reject it, and the CLI
+/// can offer the exact set of values as completions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    /// Disable all logging.
+    Off,
+    /// Errors only.
+    Error,
+    /// Warnings and errors.
+    Warn,
+    /// Normal output (the default).
+    #[default]
+    Info,
+    /// Verbose diagnostics.
+    Debug,
+    /// Everything, including traces.
+    Trace,
 }
 
-/// Canonical name of a [`LevelFilter`] (as accepted by [`parse_level`]).
-pub fn level_name(filter: LevelFilter) -> &'static str {
-    match filter {
-        LevelFilter::Off => "off",
-        LevelFilter::Error => "error",
-        LevelFilter::Warn => "warn",
-        LevelFilter::Info => "info",
-        LevelFilter::Debug => "debug",
-        LevelFilter::Trace => "trace",
+impl LogLevel {
+    /// Every level, from quietest to most verbose.
+    pub const ALL: [LogLevel; 6] = [
+        LogLevel::Off,
+        LogLevel::Error,
+        LogLevel::Warn,
+        LogLevel::Info,
+        LogLevel::Debug,
+        LogLevel::Trace,
+    ];
+
+    /// Convert to the [`log`] crate's filter.
+    pub const fn to_filter(self) -> LevelFilter {
+        match self {
+            LogLevel::Off => LevelFilter::Off,
+            LogLevel::Error => LevelFilter::Error,
+            LogLevel::Warn => LevelFilter::Warn,
+            LogLevel::Info => LevelFilter::Info,
+            LogLevel::Debug => LevelFilter::Debug,
+            LogLevel::Trace => LevelFilter::Trace,
+        }
+    }
+
+    /// Convert from the [`log`] crate's filter.
+    pub const fn from_filter(filter: LevelFilter) -> Self {
+        match filter {
+            LevelFilter::Off => LogLevel::Off,
+            LevelFilter::Error => LogLevel::Error,
+            LevelFilter::Warn => LogLevel::Warn,
+            LevelFilter::Info => LogLevel::Info,
+            LevelFilter::Debug => LogLevel::Debug,
+            LevelFilter::Trace => LogLevel::Trace,
+        }
+    }
+
+    /// Canonical lowercase name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            LogLevel::Off => "off",
+            LogLevel::Error => "error",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
+        }
+    }
+
+    /// Serialise to the compact integer stored atomically.
+    const fn to_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Inverse of [`LogLevel::to_u8`]; unknown values fall back to the default.
+    const fn from_u8(value: u8) -> Self {
+        match value {
+            0 => LogLevel::Off,
+            1 => LogLevel::Error,
+            2 => LogLevel::Warn,
+            3 => LogLevel::Info,
+            4 => LogLevel::Debug,
+            5 => LogLevel::Trace,
+            _ => DEFAULT_LEVEL,
+        }
+    }
+}
+
+impl std::fmt::Display for LogLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for LogLevel {
+    type Err = String;
+
+    /// Parse a level name, case-insensitively. `warning` and `none` are
+    /// accepted as aliases for `warn` and `off`.
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" => Ok(LogLevel::Off),
+            "error" => Ok(LogLevel::Error),
+            "warn" | "warning" => Ok(LogLevel::Warn),
+            "info" => Ok(LogLevel::Info),
+            "debug" => Ok(LogLevel::Debug),
+            "trace" => Ok(LogLevel::Trace),
+            other => Err(format!(
+                "invalid log level '{other}' (expected one of: off, error, warn, info, debug, trace)"
+            )),
+        }
     }
 }
 
@@ -103,18 +170,18 @@ pub fn level_name(filter: LevelFilter) -> &'static str {
 // =============================================================================
 
 /// Read the persisted log level, if any.
-fn load_persisted_level() -> Option<LevelFilter> {
+fn load_persisted_level() -> Option<LogLevel> {
     let key = open_key(HKEY_CURRENT_USER, CONFIG_KEY).ok()?;
     let _guard = RegKeyGuard::new(key);
     let raw = get_reg_value(key, Some(LOG_LEVEL_VALUE)).ok()?;
-    parse_level(&raw)
+    raw.parse().ok()
 }
 
 /// Persist a log level for future processes under `HKCU`.
-pub fn persist_level(filter: LevelFilter) -> Result<()> {
+pub fn persist_level(level: LogLevel) -> Result<()> {
     let key = create_key(HKEY_CURRENT_USER, CONFIG_KEY)?;
     let _guard = RegKeyGuard::new(key);
-    set_reg_value(key, Some(LOG_LEVEL_VALUE), level_name(filter))
+    set_reg_value(key, Some(LOG_LEVEL_VALUE), level.as_str())
 }
 
 // =============================================================================
@@ -136,7 +203,6 @@ struct Dedupe {
 }
 
 struct RcmLogger {
-    filter: AtomicU8,
     target: Target,
     dedupe: Mutex<Dedupe>,
 }
@@ -202,7 +268,7 @@ impl RcmLogger {
 
 impl Log for RcmLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        match u8_to_filter(self.filter.load(Ordering::Relaxed)).to_level() {
+        match active_level().to_filter().to_level() {
             Some(max) => metadata.level() <= max,
             None => false,
         }
@@ -228,15 +294,27 @@ impl Log for RcmLogger {
 static INIT: OnceLock<()> = OnceLock::new();
 static LOGGER: OnceLock<&'static RcmLogger> = OnceLock::new();
 
+/// The level currently in effect, independent of whether a logger has been
+/// installed yet.
+///
+/// Keeping this global (rather than inside [`RcmLogger`]) means
+/// [`apply_level`] and [`current_level`] stay correct even before
+/// initialisation — e.g. if a lib user calls `start()` without `init_dll()`.
+static ACTIVE_LEVEL: AtomicU8 = AtomicU8::new(LogLevel::Info as u8);
+
+fn active_level() -> LogLevel {
+    LogLevel::from_u8(ACTIVE_LEVEL.load(Ordering::Relaxed))
+}
+
 /// Effective level for a freshly initialised process.
 ///
 /// `RCM_LOG` (if set and valid) overrides the persisted setting, which in turn
 /// overrides [`DEFAULT_LEVEL`].
-fn initial_level() -> LevelFilter {
+fn initial_level() -> LogLevel {
     if let Ok(raw) = std::env::var("RCM_LOG")
-        && let Some(filter) = parse_level(&raw)
+        && let Ok(level) = raw.parse::<LogLevel>()
     {
-        return filter;
+        return level;
     }
     load_persisted_level().unwrap_or(DEFAULT_LEVEL)
 }
@@ -244,8 +322,8 @@ fn initial_level() -> LevelFilter {
 fn init(target: Target) {
     INIT.get_or_init(|| {
         let level = initial_level();
+        ACTIVE_LEVEL.store(level.to_u8(), Ordering::Relaxed);
         let logger: &'static RcmLogger = Box::leak(Box::new(RcmLogger {
-            filter: AtomicU8::new(filter_to_u8(level)),
             target,
             dedupe: Mutex::new(Dedupe {
                 hash: 0,
@@ -256,7 +334,7 @@ fn init(target: Target) {
         if log::set_logger(logger).is_ok() {
             // `set_logger` does not touch the global max level (which defaults
             // to `Off`), so it must be set explicitly or nothing is emitted.
-            log::set_max_level(level);
+            log::set_max_level(level.to_filter());
         }
     });
 }
@@ -285,27 +363,21 @@ pub fn init_dll() {
 // =============================================================================
 
 /// Currently active level of this process.
-pub fn current_level() -> LevelFilter {
-    LOGGER
-        .get()
-        .map(|logger| u8_to_filter(logger.filter.load(Ordering::Relaxed)))
-        .unwrap_or(DEFAULT_LEVEL)
+pub fn current_level() -> LogLevel {
+    active_level()
 }
 
 /// Change the level of this process only (no persistence).
 ///
-/// Used to apply a level pushed over the control pipe into a running DLL.
-pub(crate) fn apply_level(filter: LevelFilter) {
-    if let Some(logger) = LOGGER.get() {
-        logger
-            .filter
-            .store(filter_to_u8(filter), Ordering::Relaxed);
-    }
-    log::set_max_level(filter);
+/// Used to apply a level pushed over the pipe into a running DLL. Works even
+/// before [`init_console`] / [`init_dll`] have run.
+pub(crate) fn apply_level(level: LogLevel) {
+    ACTIVE_LEVEL.store(level.to_u8(), Ordering::Relaxed);
+    log::set_max_level(level.to_filter());
 }
 
 /// Set the level for this process and persist it for future processes.
-pub fn set_level(filter: LevelFilter) -> Result<()> {
-    apply_level(filter);
-    persist_level(filter)
+pub fn set_level(level: LogLevel) -> Result<()> {
+    apply_level(level);
+    persist_level(level)
 }

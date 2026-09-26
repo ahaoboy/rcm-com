@@ -1,10 +1,8 @@
-//! DLL utility helpers — module handle, path resolution, rate-limited logging,
-//! asynchronous pipe delivery, and named-pipe security descriptors.
+//! DLL utility helpers — module handle, path resolution, timestamps, and
+//! named-pipe security descriptors.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use chrono::Utc;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, HMODULE, LocalFree};
@@ -24,9 +22,6 @@ pub(crate) static DLL_MODULE: AtomicUsize = AtomicUsize::new(0);
 
 /// Global COM object reference count for `DllCanUnloadNow`.
 pub(crate) static DLL_REF_COUNT: AtomicU32 = AtomicU32::new(0);
-
-/// True while the background context-sender thread is alive.
-static SENDER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 // =============================================================================
 // Module path resolution
@@ -92,97 +87,6 @@ pub(crate) fn dll_dir() -> Option<std::path::PathBuf> {
 /// Return a UTC timestamp string for log entries and captured events.
 pub(crate) fn timestamp() -> String {
     Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string()
-}
-
-// =============================================================================
-// Asynchronous context-menu delivery
-// =============================================================================
-//
-// Historically `QueryContextMenu` opened the data pipe and wrote to it
-// synchronously on the Explorer UI thread. If the listener was busy (the
-// server handles one connection at a time) this blocked the UI, and an
-// unresponsive listener could stall Explorer entirely. The payload is now
-// handed to a dedicated sender thread through a bounded queue, so the COM
-// callback never blocks.
-
-/// Bounded queue depth — when full, newest events are dropped.
-const SEND_QUEUE_CAP: usize = 32;
-/// Idle time after which the sender thread exits (so the DLL can unload).
-const SEND_IDLE_MS: u64 = 10_000;
-
-static SENDER: Mutex<Option<std::sync::mpsc::SyncSender<String>>> = Mutex::new(None);
-
-/// Whether the background sender thread is currently alive.
-pub(crate) fn sender_active() -> bool {
-    SENDER_ACTIVE.load(Ordering::Acquire)
-}
-
-/// Queue a context-menu JSON payload for asynchronous delivery.
-///
-/// Never blocks. If the queue is full or the sender could not be started the
-/// event is dropped and a rate-limited log entry is written.
-pub(crate) fn send_context(json: String) {
-    use std::sync::mpsc::TrySendError;
-
-    let mut guard = SENDER.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.is_none() {
-        *guard = spawn_sender();
-    }
-    match guard.as_ref() {
-        Some(tx) => match tx.try_send(json) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                drop(guard);
-                log::warn!("context pipe queue full — event dropped");
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                *guard = None;
-                drop(guard);
-                log::warn!("context sender thread gone — event dropped");
-            }
-        },
-        None => {
-            drop(guard);
-            log::error!("failed to start context sender thread");
-        }
-    }
-}
-
-/// Spawn the sender thread, returning its queue handle.
-fn spawn_sender() -> Option<std::sync::mpsc::SyncSender<String>> {
-    use std::sync::mpsc::sync_channel;
-
-    let (tx, rx) = sync_channel::<String>(SEND_QUEUE_CAP);
-    SENDER_ACTIVE.store(true, Ordering::Release);
-    let spawned = std::thread::Builder::new()
-        .name("rcm-context-sender".into())
-        .spawn(move || {
-            // Idle timeout or channel closed ends the loop, so the DLL can be
-            // unloaded again.
-            while let Ok(msg) = rx.recv_timeout(Duration::from_millis(SEND_IDLE_MS)) {
-                if let Err(err) = deliver(&msg) {
-                    log::error!("context pipe delivery failed: {err}");
-                }
-            }
-            // Publish `None` while holding the lock so a concurrent
-            // `send_context` sees a consistent state and respawns if needed.
-            let mut guard = SENDER.lock().unwrap_or_else(|e| e.into_inner());
-            *guard = None;
-            SENDER_ACTIVE.store(false, Ordering::Release);
-        });
-    if spawned.is_err() {
-        SENDER_ACTIVE.store(false, Ordering::Release);
-        return None;
-    }
-    Some(tx)
-}
-
-/// Blocking delivery to the listener — runs on the sender thread only.
-fn deliver(json: &str) -> std::io::Result<()> {
-    let mut pipe = std::fs::OpenOptions::new()
-        .write(true)
-        .open(crate::consts::PIPE_NAME)?;
-    std::io::Write::write_all(&mut pipe, json.as_bytes())
 }
 
 // =============================================================================

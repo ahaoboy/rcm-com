@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
-use log::LevelFilter;
-use rcm_com::logging;
-use rcm_com::{PIPE_NAME, cmd, error::RcmError, server::listen};
+use rcm_com::logging::{self, LogLevel};
+use rcm_com::{cmd, error::RcmError, server::listen};
 use rcm_reg::{MenuStyle, restart_explorer};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "rcm")]
@@ -36,10 +36,15 @@ enum Commands {
     Enable,
     /// Query whether menu blocking is currently enabled
     Query,
-    /// Show or change the log level (`off`|`error`|`warn`|`info`|`debug`|`trace`)
+    /// Query or change the log level
     Log {
         #[command(subcommand)]
         action: Option<LogAction>,
+    },
+    /// Register or query the program that is using the pipe
+    Client {
+        #[command(subcommand)]
+        action: Option<ClientAction>,
     },
 }
 
@@ -59,45 +64,91 @@ enum MenuAction {
 
 #[derive(Subcommand)]
 enum LogAction {
-    /// Disable all logging
-    Off,
-    /// Log errors only
-    Error,
-    /// Log warnings and errors
-    Warn,
-    /// Log informational messages and above (default)
-    Info,
-    /// Log debug messages and above
-    Debug,
-    /// Log everything, including traces
-    Trace,
+    /// Show the log level currently used by the shell extension
+    Get,
+    /// Set the log level (persisted, and pushed to the shell extension)
+    Set {
+        /// The new log level
+        level: LogLevel,
+    },
 }
 
-impl LogAction {
-    fn filter(&self) -> LevelFilter {
-        match self {
-            LogAction::Off => LevelFilter::Off,
-            LogAction::Error => LevelFilter::Error,
-            LogAction::Warn => LevelFilter::Warn,
-            LogAction::Info => LevelFilter::Info,
-            LogAction::Debug => LevelFilter::Debug,
-            LogAction::Trace => LevelFilter::Trace,
+#[derive(Subcommand)]
+enum ClientAction {
+    /// Show the absolute path of the program registered as using the pipe
+    Get,
+    /// Register a program path as the user of the pipe
+    Set {
+        /// Path to register; defaults to this executable
+        path: Option<PathBuf>,
+    },
+}
+
+/// Show or change the log level.
+///
+/// `Get` asks the running shell extension for its *live* level and falls back
+/// to this process's level (persisted setting) when it is not loaded. `Set`
+/// persists the level and pushes it to the extension if it is running.
+async fn handle_log(action: Option<LogAction>) -> Result<(), RcmError> {
+    match action.unwrap_or(LogAction::Get) {
+        LogAction::Get => match rcm_com::get_log_level().await {
+            Ok(level) => {
+                log::info!("log level: {level} (shell extension)");
+                Ok(())
+            }
+            Err(_) => {
+                log::info!(
+                    "log level: {} (local; shell extension not running)",
+                    logging::current_level()
+                );
+                Ok(())
+            }
+        },
+        LogAction::Set { level } => {
+            logging::set_level(level)?;
+            log::info!("log level set to '{level}'");
+            if !rcm_com::try_set_remote_log_level(level).await {
+                log::warn!("shell extension not updated — the new level applies after it reloads");
+            }
+            Ok(())
         }
     }
 }
 
-/// Persist and apply a new log level, then ask the loaded shell extension to
-/// adopt it. Failing to reach the extension is not fatal — the level is already
-/// stored for the next time it loads.
-fn set_log_level(action: LogAction) -> Result<(), RcmError> {
-    let filter = action.filter();
-    logging::set_level(filter)?;
-    let live = rcm_com::try_set_remote_log_level(logging::level_name(filter));
-    log::info!("log level set to '{}'", logging::level_name(filter));
-    if !live {
-        log::warn!("shell extension not updated — the new level applies after it reloads");
+/// Show or register the program that is using the pipe.
+async fn handle_client(action: Option<ClientAction>) -> Result<(), RcmError> {
+    match action.unwrap_or(ClientAction::Get) {
+        ClientAction::Get => match rcm_com::get_client().await {
+            Ok(Some(path)) => {
+                log::info!("{path}");
+                Ok(())
+            }
+            Ok(None) => {
+                log::info!("no program registered");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        },
+        ClientAction::Set { path } => {
+            let path = resolve_path(path)?;
+            rcm_com::set_client(path.clone()).await?;
+            log::info!("registered pipe user: {path}");
+            Ok(())
+        }
     }
-    Ok(())
+}
+
+/// Resolve a path argument to an absolute path, defaulting to this executable.
+fn resolve_path(path: Option<PathBuf>) -> Result<String, RcmError> {
+    let path = match path {
+        Some(path) if path.is_absolute() => path,
+        Some(path) => std::env::current_dir()
+            .map_err(|e| RcmError::Environment(format!("cannot read current directory: {e}")))?
+            .join(path),
+        None => std::env::current_exe()
+            .map_err(|e| RcmError::Environment(format!("cannot resolve executable path: {e}")))?,
+    };
+    Ok(path.to_string_lossy().into_owned())
 }
 
 #[tokio::main]
@@ -118,15 +169,12 @@ async fn main() {
     let result = match cli.command {
         Commands::Install => cmd::register(),
         Commands::Uninstall => cmd::unregister(),
-        Commands::Start => {
-            log::info!("Listening for Explorer context menu events on pipe: {PIPE_NAME}");
-            listen(|info| {
-                // Human-readable summary on `info`, full struct on `debug`.
-                log::info!("{info}");
-                log::debug!("{info:#?}");
-            })
-            .await
-        }
+        Commands::Start => listen(|info| {
+            // Human-readable summary on `info`, full struct on `debug`.
+            log::info!("{info}");
+            log::debug!("{info:#?}");
+        })
+        .await,
         Commands::Status => cmd::status().map(|s| {
             log::info!("{s}");
         }),
@@ -149,13 +197,13 @@ async fn main() {
         Commands::RestartExplorer => {
             restart_explorer(std::time::Duration::from_secs(5)).map_err(RcmError::from)
         }
-        Commands::Enable => rcm_com::enable().map(|_| {
+        Commands::Enable => rcm_com::enable().await.map(|_| {
             log::info!("Menu blocking ENABLED — native context menu will be hidden.");
         }),
-        Commands::Disable => rcm_com::disable().map(|_| {
+        Commands::Disable => rcm_com::disable().await.map(|_| {
             log::info!("Menu blocking DISABLED — native context menu will be shown.");
         }),
-        Commands::Query => match rcm_com::query() {
+        Commands::Query => match rcm_com::query().await {
             Ok(enabled) => {
                 log::info!(
                     "Menu blocking: {}",
@@ -165,13 +213,8 @@ async fn main() {
             }
             Err(e) => Err(e),
         },
-        Commands::Log { action } => match action {
-            Some(action) => set_log_level(action),
-            None => {
-                log::info!("log level: {}", logging::level_name(logging::current_level()));
-                Ok(())
-            }
-        },
+        Commands::Log { action } => handle_log(action).await,
+        Commands::Client { action } => handle_client(action).await,
     };
 
     // A non-zero exit code lets scripts and CI detect failure.
