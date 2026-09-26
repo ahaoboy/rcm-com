@@ -27,15 +27,13 @@ use std::time::{Duration, Instant};
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use serde::{Deserialize, Serialize};
-use windows::Win32::System::Registry::HKEY_CURRENT_USER;
 
-use crate::cmd::{RegKeyGuard, create_key, get_reg_value, open_key, set_reg_value};
+use crate::cmd;
+use crate::consts::CONFIG_LOG_LEVEL;
 use crate::error::Result;
 
-/// Registry key (under `HKCU`) holding user-scoped settings.
-const CONFIG_KEY: &str = r"Software\RcmCom";
 /// Registry value name for the persisted log level.
-const LOG_LEVEL_VALUE: &str = "LogLevel";
+const LOG_LEVEL_VALUE: &str = CONFIG_LOG_LEVEL;
 
 /// Level used when nothing has been configured.
 const DEFAULT_LEVEL: LogLevel = LogLevel::Info;
@@ -171,17 +169,12 @@ impl FromStr for LogLevel {
 
 /// Read the persisted log level, if any.
 fn load_persisted_level() -> Option<LogLevel> {
-    let key = open_key(HKEY_CURRENT_USER, CONFIG_KEY).ok()?;
-    let _guard = RegKeyGuard::new(key);
-    let raw = get_reg_value(key, Some(LOG_LEVEL_VALUE)).ok()?;
-    raw.parse().ok()
+    cmd::read_config(LOG_LEVEL_VALUE)?.parse().ok()
 }
 
 /// Persist a log level for future processes under `HKCU`.
 pub fn persist_level(level: LogLevel) -> Result<()> {
-    let key = create_key(HKEY_CURRENT_USER, CONFIG_KEY)?;
-    let _guard = RegKeyGuard::new(key);
-    set_reg_value(key, Some(LOG_LEVEL_VALUE), level.as_str())
+    cmd::write_config(LOG_LEVEL_VALUE, level.as_str())
 }
 
 // =============================================================================

@@ -66,7 +66,11 @@ pub(crate) enum Request {
     ///
     /// The optional path is the client's own executable; the server records it
     /// as the program currently using the pipe.
-    Subscribe { path: Option<String> },
+    Subscribe {
+        path: Option<String>,
+        #[serde(default)]
+        options: SubscribeOptions,
+    },
     /// Change the log level of the running DLL.
     SetLog { level: LogLevel },
     /// Ask the running DLL for its current log level.
@@ -75,6 +79,24 @@ pub(crate) enum Request {
     SetClient { path: String },
     /// Ask which program is recorded as using the pipe.
     GetClient,
+    /// Set whether Shift+right-click shows the native menu.
+    SetShiftBypass { enabled: bool },
+    /// Ask whether Shift+right-click shows the native menu.
+    GetShiftBypass,
+}
+
+/// Optional initialisation parameters a subscriber can pass with
+/// [`Request::Subscribe`].
+///
+/// Every field is optional: an omitted field leaves the corresponding setting
+/// unchanged, so a client only sends what it cares about.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub(crate) struct SubscribeOptions {
+    /// Show the native menu on Shift+right-click. Applied to the DLL for this
+    /// session only (not persisted) — the last subscriber to pass a value wins,
+    /// since menu blocking is global.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shift_bypass: Option<bool>,
 }
 
 /// A message sent from the DLL server to a CLI client.
@@ -89,6 +111,8 @@ pub(crate) enum Response {
     LogLevel { level: LogLevel },
     /// Reply to [`Request::GetClient`]; `None` when nothing is registered.
     Client { path: Option<String> },
+    /// Reply to [`Request::GetShiftBypass`].
+    ShiftBypass { enabled: bool },
     /// The request could not be applied.
     Error { message: String },
     /// A captured context-menu event, delivered to subscribers.
@@ -249,7 +273,7 @@ async fn handle_connection(server: NamedPipeServer) {
     };
 
     match request {
-        Request::Subscribe { path } => handle_subscription(reader, writer, path).await,
+        Request::Subscribe { path, options } => handle_subscription(reader, writer, path, options).await,
         Request::Enable => {
             crate::control::set_enabled(true);
             reply(&mut writer, &Response::Ok, handle).await;
@@ -278,6 +302,14 @@ async fn handle_connection(server: NamedPipeServer) {
             let path = client_path();
             reply(&mut writer, &Response::Client { path }, handle).await;
         }
+        Request::SetShiftBypass { enabled } => {
+            crate::control::apply_shift_bypass(enabled);
+            reply(&mut writer, &Response::Ok, handle).await;
+        }
+        Request::GetShiftBypass => {
+            let enabled = crate::control::shift_bypass();
+            reply(&mut writer, &Response::ShiftBypass { enabled }, handle).await;
+        }
     }
 }
 
@@ -299,11 +331,21 @@ async fn handle_subscription(
     mut reader: BufReader<ReadHalf<NamedPipeServer>>,
     mut writer: WriteHalf<NamedPipeServer>,
     client: Option<String>,
+    options: SubscribeOptions,
 ) {
     // A subscriber announces its own executable, which is what
     // `rcm client get` reports as the program using the pipe.
     if let Some(path) = client {
         set_client_path(path);
+    }
+    // Subscription options are applied to the DLL for this session only.
+    // Menu blocking is global, so the last subscriber to pass a value wins.
+    if let Some(enabled) = options.shift_bypass {
+        crate::control::apply_shift_bypass(enabled);
+        log::info!(
+            "subscriber set shift+right-click native menu to '{}'",
+            if enabled { "on" } else { "off" }
+        );
     }
 
     let id = NEXT_SUBSCRIBER_ID.fetch_add(1, Ordering::Relaxed);
@@ -449,7 +491,12 @@ pub(crate) async fn request(request: &Request, timeout: Duration) -> Result<Resp
 
 /// Subscribe to the context-menu event stream, reconnecting if the shell
 /// extension (or Explorer) restarts. Runs until the process exits.
-pub(crate) async fn subscribe<F>(mut on_event: F) -> Result<()>
+///
+/// `options` are sent with every (re)subscription; see [`SubscribeOptions`].
+pub(crate) async fn subscribe<F>(
+    mut on_event: F,
+    options: Option<bool>,
+) -> Result<()>
 where
     F: FnMut(ContextMenuInfo),
 {
@@ -461,6 +508,9 @@ where
                 path: std::env::current_exe()
                     .ok()
                     .map(|path| path.to_string_lossy().into_owned()),
+                options: SubscribeOptions {
+                    shift_bypass: options,
+                },
             },
         )
         .await

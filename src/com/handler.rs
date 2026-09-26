@@ -17,7 +17,7 @@ use crate::com::dataobj::extract_selected_files;
 use crate::com::vtable::{IContextMenuVtbl, IShellExtInitVtbl, IUnknownVtbl};
 use crate::consts::*;
 use crate::helpers::{self, DLL_REF_COUNT};
-use crate::hooks::install_cbt_menu_blocker;
+use crate::hooks::{allow_native_menu, install_cbt_menu_blocker, reset_native_menu_override};
 use crate::types::{ContextMenuInfo, Event};
 
 // =============================================================================
@@ -176,6 +176,9 @@ unsafe extern "system" fn handler_initialize(
         // Always install the CBT hook to block native context menu windows.
         // This works for both Win10 (TrackPopupMenu) and Win11 (new menu).
         install_cbt_menu_blocker();
+        // A new invocation starts with blocking in effect; a Shift from a
+        // previous right-click must not leak into this one.
+        reset_native_menu_override();
 
         let handler = &*(this as *const ContextMenuHandler);
         let Ok(mut info) = handler.info.lock() else {
@@ -259,6 +262,17 @@ unsafe extern "system" fn handler_query_context_menu(
                 info.event = Event::Shift { flags: uflags };
             } else {
                 info.event = Event::Menu { flags: uflags };
+            }
+
+            // Shift+right-click (CMF_EXTENDEDVERBS) is an explicit request for
+            // the extended verb list — on Windows 11 it is how the classic menu
+            // is reached. When the policy allows it, let the native menu appear
+            // for this invocation while still reporting the event; the
+            // override is consumed by the CBT hook when the menu window is
+            // created. `rcm shift set off` (or a subscriber option) disables
+            // the bypass so Shift is intercepted like any other right-click.
+            if uflags & CMF_EXTENDEDVERBS != 0 && crate::control::shift_bypass() {
+                allow_native_menu();
             }
 
             // Skip CMF_VERBSONLY queries: these come from the lnkfile

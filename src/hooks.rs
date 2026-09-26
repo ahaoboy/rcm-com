@@ -10,6 +10,11 @@
 //! this bound, every `#32768` window created on the thread — including
 //! unrelated shell popups and dropdowns — was suppressed.
 //!
+//! Within that window a single invocation can opt out via
+//! [`allow_native_menu`]: Shift+right-click reports `CMF_EXTENDEDVERBS`, and in
+//! that case the user explicitly asked for the extended verb list, so the
+//! native menu is shown instead of being intercepted.
+//!
 //! ## Lifecycle
 //!
 //! Hooks are installed per Explorer thread (`WH_CBT` is bound to the thread id
@@ -56,6 +61,10 @@ thread_local! {
     /// Handle of the active WH_CBT hook for this thread (unused directly; kept
     /// so a thread's hook can be identified) — see [`HOOKS`] for the registry.
     static CBT_HOOK_HANDLE: Cell<isize> = const { Cell::new(0) };
+
+    /// Set for the duration of one shell-extension invocation to let the
+    /// native menu through even while blocking is enabled.
+    static ALLOW_NATIVE_MENU: Cell<bool> = const { Cell::new(false) };
 }
 
 fn monotonic_ms() -> u64 {
@@ -67,6 +76,29 @@ fn blocking_active() -> bool {
     deadline != 0 && monotonic_ms() <= deadline
 }
 
+/// Allow the native context menu for the current invocation on this thread.
+///
+/// Called from `IContextMenu::QueryContextMenu` when Explorer reports
+/// `CMF_EXTENDEDVERBS` (Shift+right-click, i.e. the user explicitly asked for
+/// the extended verb list). The state is thread-local because Explorer calls
+/// `QueryContextMenu` and then `TrackPopupMenu` — which creates the `#32768`
+/// window this hook sees — on the same thread.
+pub(crate) fn allow_native_menu() {
+    ALLOW_NATIVE_MENU.with(|cell| cell.set(true));
+}
+
+/// Clear the per-invocation override.
+///
+/// Called from `IShellExtInit::Initialize` so a Shift from a previous
+/// right-click cannot leak into the next, unrelated one.
+pub(crate) fn reset_native_menu_override() {
+    ALLOW_NATIVE_MENU.with(|cell| cell.set(false));
+}
+
+fn native_menu_allowed() -> bool {
+    ALLOW_NATIVE_MENU.with(Cell::get)
+}
+
 /// CBT hook procedure — called before windows are created on our thread.
 ///
 /// When `code == HCBT_CREATEWND` (3), `lparam` points to a `CBT_CREATEWNDW`
@@ -74,13 +106,18 @@ fn blocking_active() -> bool {
 /// atom 32768 (0x8000). We return 1 to prevent its creation.
 unsafe extern "system" fn cbt_hook_proc(code: i32, _wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // HCBT_CREATEWND = 3
-    if code == 3 && crate::control::is_enabled() && blocking_active() {
+    if code == 3 {
         unsafe {
             let cbt_ptr = lparam.0 as *const CBT_CREATEWNDW;
             if !cbt_ptr.is_null() && !(*cbt_ptr).lpcs.is_null() {
                 let cs = &*(*cbt_ptr).lpcs;
                 // For system classes, lpszClass is MAKEINTATOM(32768) = 0x8000.
-                if cs.lpszClass.0 as usize == 32768 {
+                let is_system_menu = cs.lpszClass.0 as usize == 32768;
+                if is_system_menu
+                    && crate::control::is_enabled()
+                    && blocking_active()
+                    && !native_menu_allowed()
+                {
                     return LRESULT(1);
                 }
             }

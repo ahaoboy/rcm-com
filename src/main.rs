@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use rcm_com::logging::{self, LogLevel};
 use rcm_com::{cmd, error::RcmError, server::listen};
 use rcm_reg::{MenuStyle, restart_explorer};
@@ -46,6 +46,11 @@ enum Commands {
         #[command(subcommand)]
         action: Option<ClientAction>,
     },
+    /// Show or change whether Shift+right-click shows the native menu
+    Shift {
+        #[command(subcommand)]
+        action: Option<ShiftAction>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -81,6 +86,32 @@ enum ClientAction {
     Set {
         /// Path to register; defaults to this executable
         path: Option<PathBuf>,
+    },
+}
+
+/// A plain on/off switch for command arguments.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OnOff {
+    On,
+    Off,
+}
+
+impl From<OnOff> for bool {
+    fn from(value: OnOff) -> Self {
+        matches!(value, OnOff::On)
+    }
+}
+
+#[derive(Subcommand)]
+enum ShiftAction {
+    /// Show the current Shift+right-click behaviour
+    Get,
+    /// Set the behaviour for the current Explorer session
+    Set {
+        /// `on` = Shift+right-click shows the native menu (default);
+        /// `off` = Shift is intercepted like any other right-click
+        #[arg(value_enum)]
+        state: OnOff,
     },
 }
 
@@ -136,6 +167,42 @@ async fn handle_client(action: Option<ClientAction>) -> Result<(), RcmError> {
             Ok(())
         }
     }
+}
+
+/// Show or change whether Shift+right-click shows the native menu.
+///
+/// The setting lives only in the running shell extension (it is not persisted),
+/// so both `Get` and `Set` require it to be loaded. `Set` affects the current
+/// Explorer session; an Explorer restart returns to the default (`on`).
+async fn handle_shift(action: Option<ShiftAction>) -> Result<(), RcmError> {
+    match action.unwrap_or(ShiftAction::Get) {
+        ShiftAction::Get => match rcm_com::get_shift_bypass().await {
+            Ok(enabled) => {
+                log::info!(
+                    "Shift+right-click native menu: {} (shell extension)",
+                    on_off(enabled)
+                );
+                Ok(())
+            }
+            Err(e) => {
+                log::warn!("shell extension not running — default is 'on'");
+                Err(e)
+            }
+        },
+        ShiftAction::Set { state } => {
+            let enabled = bool::from(state);
+            rcm_com::set_shift_bypass(enabled).await?;
+            log::info!(
+                "Shift+right-click native menu set to '{}' (this session only)",
+                on_off(enabled)
+            );
+            Ok(())
+        }
+    }
+}
+
+fn on_off(value: bool) -> &'static str {
+    if value { "on" } else { "off" }
 }
 
 /// Resolve a path argument to an absolute path, defaulting to this executable.
@@ -215,6 +282,7 @@ async fn main() {
         },
         Commands::Log { action } => handle_log(action).await,
         Commands::Client { action } => handle_client(action).await,
+        Commands::Shift { action } => handle_shift(action).await,
     };
 
     // A non-zero exit code lets scripts and CI detect failure.

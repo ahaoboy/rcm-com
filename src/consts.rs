@@ -13,6 +13,15 @@ pub const IID_ICONTEXTMENU: GUID = GUID::from_u128(0x000214E4_0000_0000_C000_000
 
 pub const HANDLER_NAME: &str = "RcmContextMenu";
 
+/// User-scoped settings key (`HKEY_CURRENT_USER\Software\RcmCom`).
+///
+/// Holds persisted preferences such as the log level and the Shift+right-click
+/// behaviour, read by both the CLI and the DLL.
+pub const CONFIG_REG_KEY: &str = r"Software\RcmCom";
+
+/// Config value name for the persisted log level (see [`crate::logging`]).
+pub const CONFIG_LOG_LEVEL: &str = "LogLevel";
+
 /// Named pipe path used for **all** communication between the shell extension
 /// DLL (the server) and the `rcm` CLI (the client).
 ///

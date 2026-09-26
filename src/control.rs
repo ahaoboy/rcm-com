@@ -5,9 +5,11 @@
 //! `rcm` CLI — there is no longer a separate control pipe.
 //!
 //! The CBT hook and `QueryContextMenu` consult [`is_enabled`] before
-//! intercepting the native menu.
+//! intercepting the native menu, and [`shift_bypass`] to decide whether
+//! Shift+right-click is allowed to show it anyway.
 //!
-//! Public API: [`enable`], [`disable`], [`query`], [`start`],
+//! Public API: [`enable`], [`disable`], [`query`], [`is_enabled`], [`start`],
+//! [`shift_bypass`], [`set_shift_bypass`], [`get_shift_bypass`],
 //! [`get_log_level`], [`set_log_level`], [`try_set_remote_log_level`],
 //! [`get_client`], and [`set_client`].
 
@@ -26,6 +28,16 @@ use crate::pipe::{self, Request, Response};
 /// `false` = let the system menu appear normally.
 static MENU_BLOCKING_ENABLED: AtomicBool = AtomicBool::new(true);
 
+/// `true` = let Shift+right-click show the native menu (default).
+///
+/// On Windows 11 the classic context menu is reached with Shift+right-click,
+/// so the default keeps that escape hatch working while a plain right-click is
+/// still intercepted. Set to `false` to intercept Shift as well.
+///
+/// This is deliberately **not persisted**: it lives only in the running DLL, so
+/// an Explorer restart returns to the default.
+static SHIFT_BYPASS: AtomicBool = AtomicBool::new(true);
+
 /// Timeout for one-shot control commands (`enable` / `disable` / `query`).
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Short timeout for best-effort notifications such as pushing a log level.
@@ -39,6 +51,11 @@ const NOTIFY_TIMEOUT: Duration = Duration::from_millis(200);
 ///
 /// Called from `cf_create_instance` (a normal COM activation thread), never
 /// from `DllMain`, which runs under the loader lock. Idempotent.
+///
+/// Unlike the DLL's own entry point, this does **not** install the `log`
+/// backend — embedding programs decide their own logging. Call
+/// [`crate::logging::init_dll`] (or any `log` logger) first if you want the
+/// extension's log messages to appear.
 pub fn start() {
     pipe::start_server();
 }
@@ -53,6 +70,20 @@ pub fn is_enabled() -> bool {
 /// Update the blocking state (called by the pipe server for `enable`/`disable`).
 pub(crate) fn set_enabled(enabled: bool) {
     MENU_BLOCKING_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether Shift+right-click shows the native menu instead of being
+/// intercepted (default `true`).
+pub fn shift_bypass() -> bool {
+    SHIFT_BYPASS.load(Ordering::Relaxed)
+}
+
+/// Update the Shift+right-click policy for this process only.
+///
+/// Used by the pipe server when a subscriber passes it as a subscription
+/// option, and when `rcm shift set` reaches a running DLL.
+pub(crate) fn apply_shift_bypass(enabled: bool) {
+    SHIFT_BYPASS.store(enabled, Ordering::Relaxed);
 }
 
 // =============================================================================
@@ -99,6 +130,19 @@ pub async fn get_client() -> Result<Option<String>> {
 pub async fn get_log_level() -> Result<LogLevel> {
     match pipe::request(&Request::GetLog, CLIENT_TIMEOUT).await? {
         Response::LogLevel { level } => Ok(level),
+        other => Err(unexpected(other)),
+    }
+}
+
+/// Set the Shift+right-click policy on a running DLL (not persisted).
+pub async fn set_shift_bypass(enabled: bool) -> Result<()> {
+    expect_ok(Request::SetShiftBypass { enabled }).await
+}
+
+/// Query the Shift+right-click policy of the running DLL.
+pub async fn get_shift_bypass() -> Result<bool> {
+    match pipe::request(&Request::GetShiftBypass, CLIENT_TIMEOUT).await? {
+        Response::ShiftBypass { enabled } => Ok(enabled),
         other => Err(unexpected(other)),
     }
 }

@@ -55,6 +55,8 @@ rcm restart-explorer
 | `rcm log set <level>` | Set the log level (see [Logging](#logging)) |
 | `rcm client get` | Show which program is registered as using the pipe |
 | `rcm client set [path]` | Register a program path (defaults to this executable) |
+| `rcm shift get` | Show the Shift+right-click behaviour of the running extension |
+| `rcm shift set <on\|off>` | Change it for the current Explorer session |
 
 Every command exits `0` on success and `1` on failure, so scripts and CI can
 detect errors.
@@ -71,6 +73,96 @@ rcm client set C:\tools\app.exe  # register a specific program
 
 `rcm start` registers its own executable automatically when it subscribes, so
 `rcm client get` normally reports the running listener.
+
+## Implementing your own listener
+
+The shell extension hosts the pipe, so your program only needs to be a
+**client** — no daemon has to be running first. In Rust:
+
+```rust
+use rcm_com::server::{listen, listen_with, ListenOptions};
+
+// Reports every right-click; reconnects automatically if Explorer restarts.
+listen(|info| {
+    println!("{} -> {:?}", info.ts, info.files);
+})
+.await?;
+
+// Or pass initialisation parameters when subscribing:
+listen_with(
+    |info| println!("{info}"),
+    ListenOptions {
+        // Intercept Shift+right-click too (see below).
+        shift_bypass: Some(false),
+    },
+)
+.await?;
+```
+
+`listen` never returns; spawn it as a background task if your app has other
+work to do. It does not install a `log` backend — call
+`rcm_com::logging::init_console()` or your own logger if you want the
+library's messages.
+
+### Wire protocol
+
+Any language can implement the listener against `\\.\pipe\rcm_com`. Messages are
+**newline-delimited JSON**, one message per line. Send one request to subscribe:
+
+```json
+{"cmd":"subscribe","path":"C:\\tools\\my-listener.exe","options":{"shift_bypass":false}}
+```
+
+`path` is optional; when given it is recorded as the pipe's registered user
+(see `rcm client get`). `options` is optional too — see
+[Shift + right-click](#shift--right-click). After that the server pushes one
+JSON object per captured right-click:
+
+```json
+{"type":"event","event":{"cid":"","ts":"2026-05-26 10:30:15 UTC","x":1024,"y":768,"dir":"C:\\Users\\Admin\\Desktop","files":["C:\\Users\\Admin\\Desktop\\readme.txt"],"bg":false,"hwnd":1715004,"class":"CabinetWClass","pid":12345,"event":{"type":"Menu","flags":0}}}
+```
+
+The connection stays open; multiple clients can subscribe at once and each
+receives every event. Events captured while nobody is connected are buffered
+(the most recent few) and replayed to the next subscriber, so the right-click
+that loaded the extension is not lost.
+
+The other request types (`enable`, `disable`, `query`, `get_log`, `set_log`,
+`get_client`, `set_client`, `get_shift_bypass`, `set_shift_bypass`) each answer
+with a single `{"type":...}` line; see `src/pipe.rs` for the full list.
+
+### Shift + right-click
+
+On Windows 11 the classic (expanded) context menu is reached with
+**Shift+right-click**. Because that is an explicit request for the real menu,
+by default the extension reports the event but **does not intercept** the
+native menu — it opens as Windows would normally show it. A plain right-click
+keeps being intercepted while blocking is enabled.
+
+```bash
+rcm shift get        # current behaviour (default: on)
+rcm shift set off    # intercept Shift+right-click as well
+rcm shift set on     # restore the default escape hatch
+```
+
+This setting is **not persisted** — it lives in the loaded shell extension
+only, so an Explorer restart (or reloading the DLL) returns to the default
+`on`. That also means `rcm shift get` / `set` require the extension to be
+loaded (right-click once); they fail with an error otherwise.
+
+A **subscriber can set it for its session** via the subscribe `options`, which
+is handy when a listener needs the native menu for its own workflow:
+
+```rust
+listen_with(cb, ListenOptions { shift_bypass: Some(false) }).await?;
+```
+
+Menu blocking is global, so subscription options apply to the running extension
+for the session only (not persisted), and the last subscriber to pass a value
+wins.
+
+To turn interception off entirely, use `rcm disable`.
+
 
 ## Logging
 

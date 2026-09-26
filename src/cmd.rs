@@ -7,6 +7,22 @@ use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Shell::*;
 use windows::core::PCWSTR;
 
+// ── user config (HKCU\Software\RcmCom) ─────────────────────────────────────
+
+/// Read a persisted setting, or `None` when it has never been written.
+pub(crate) fn read_config(name: &str) -> Option<String> {
+    let key = open_key(HKEY_CURRENT_USER, crate::consts::CONFIG_REG_KEY).ok()?;
+    let _guard = RegKeyGuard::new(key);
+    get_reg_value(key, Some(name)).ok()
+}
+
+/// Persist a setting for future processes.
+pub(crate) fn write_config(name: &str, value: &str) -> Result<()> {
+    let key = create_key(HKEY_CURRENT_USER, crate::consts::CONFIG_REG_KEY)?;
+    let _guard = RegKeyGuard::new(key);
+    set_reg_value(key, Some(name), value)
+}
+
 // ── helpers ────────────────────────────────────────────────────────────────
 
 /// Convert `&str` to a null-terminated wide string.
@@ -121,8 +137,7 @@ pub(crate) fn open_key(parent: HKEY, subkey: &str) -> Result<HKEY> {
 }
 
 pub(crate) fn get_reg_value(key: HKEY, name: Option<&str>) -> Result<String> {
-    let name_wide: Option<Vec<u16>> = name.map(to_wide);
-    let name_pcwstr = name_wide
+    let name_wide: Option<Vec<u16>> = name.map(to_wide);    let name_pcwstr = name_wide
         .as_ref()
         .map(|v| PCWSTR(v.as_ptr()))
         .unwrap_or(PCWSTR::null());
