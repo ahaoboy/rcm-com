@@ -434,24 +434,16 @@ pub(crate) fn broadcast_event(event: ContextMenuInfo) {
 // Client
 // =============================================================================
 
-/// Connect to the shell extension's pipe.
+/// Connect to the shell extension's pipe for the event stream.
 ///
-/// With `timeout == None` this retries forever, which is what `rcm start` wants
-/// while it waits for the shell extension to be loaded.
-async fn connect(timeout: Option<Duration>) -> Result<NamedPipeClient> {
-    let deadline = timeout.map(|timeout| Instant::now() + timeout);
+/// Retries forever, which is what `rcm start` wants while it waits for the
+/// shell extension to be loaded.
+async fn connect() -> NamedPipeClient {
     let mut announced = false;
     loop {
         match ClientOptions::new().open(PIPE_NAME) {
-            Ok(client) => return Ok(client),
-            Err(err) => {
-                if let Some(deadline) = deadline
-                    && Instant::now() >= deadline
-                {
-                    return Err(RcmError::Environment(format!(
-                        "the shell extension is not running (pipe '{PIPE_NAME}'): {err}"
-                    )));
-                }
+            Ok(client) => return client,
+            Err(_) => {
                 if !announced {
                     announced = true;
                     log::info!("waiting for the shell extension on pipe '{PIPE_NAME}'...");
@@ -474,14 +466,39 @@ where
     Ok(())
 }
 
-/// Send a request and read the single response.
-pub(crate) async fn request(request: &Request, timeout: Duration) -> Result<Response> {
-    let mut client = connect(Some(timeout)).await?;
-    write_message(&mut client, request).await?;
+/// Send a request and read the single response, blocking the calling thread.
+///
+/// One-shot control commands are inherently "send, wait, done", so this uses
+/// plain blocking I/O and needs no async runtime — callers can use it from
+/// ordinary synchronous code. Only the event stream ([`subscribe`]) stays
+/// async, because it multiplexes a long-lived connection.
+pub(crate) fn request(request: &Request, timeout: Duration) -> Result<Response> {
+    let deadline = Instant::now() + timeout;
+    let mut pipe = loop {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(PIPE_NAME)
+        {
+            Ok(pipe) => break pipe,
+            Err(err) => {
+                if Instant::now() >= deadline {
+                    return Err(RcmError::Environment(format!(
+                        "the shell extension is not running (pipe '{PIPE_NAME}'): {err}"
+                    )));
+                }
+                std::thread::sleep(CONNECT_RETRY);
+            }
+        }
+    };
 
-    let mut reader = BufReader::new(client);
+    let mut json = serde_json::to_vec(request)?;
+    json.push(b'\n');
+    std::io::Write::write_all(&mut pipe, &json)?;
+
+    let mut reader = std::io::BufReader::new(pipe);
     let mut line = String::new();
-    if reader.read_line(&mut line).await? == 0 {
+    if std::io::BufRead::read_line(&mut reader, &mut line)? == 0 {
         return Err(RcmError::Environment(
             "the shell extension closed the connection".to_string(),
         ));
@@ -501,7 +518,7 @@ where
     F: FnMut(ContextMenuInfo),
 {
     loop {
-        let mut client = connect(None).await?;
+        let mut client = connect().await;
         if write_message(
             &mut client,
             &Request::Subscribe {

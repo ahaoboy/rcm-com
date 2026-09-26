@@ -120,9 +120,9 @@ enum ShiftAction {
 /// `Get` asks the running shell extension for its *live* level and falls back
 /// to this process's level (persisted setting) when it is not loaded. `Set`
 /// persists the level and pushes it to the extension if it is running.
-async fn handle_log(action: Option<LogAction>) -> Result<(), RcmError> {
+fn handle_log(action: Option<LogAction>) -> Result<(), RcmError> {
     match action.unwrap_or(LogAction::Get) {
-        LogAction::Get => match rcm_com::get_log_level().await {
+        LogAction::Get => match rcm_com::get_log_level() {
             Ok(level) => {
                 log::info!("log level: {level} (shell extension)");
                 Ok(())
@@ -138,7 +138,7 @@ async fn handle_log(action: Option<LogAction>) -> Result<(), RcmError> {
         LogAction::Set { level } => {
             logging::set_level(level)?;
             log::info!("log level set to '{level}'");
-            if !rcm_com::try_set_remote_log_level(level).await {
+            if !rcm_com::try_set_remote_log_level(level) {
                 log::warn!("shell extension not updated — the new level applies after it reloads");
             }
             Ok(())
@@ -147,9 +147,9 @@ async fn handle_log(action: Option<LogAction>) -> Result<(), RcmError> {
 }
 
 /// Show or register the program that is using the pipe.
-async fn handle_client(action: Option<ClientAction>) -> Result<(), RcmError> {
+fn handle_client(action: Option<ClientAction>) -> Result<(), RcmError> {
     match action.unwrap_or(ClientAction::Get) {
-        ClientAction::Get => match rcm_com::get_client().await {
+        ClientAction::Get => match rcm_com::get_client() {
             Ok(Some(path)) => {
                 log::info!("{path}");
                 Ok(())
@@ -162,7 +162,7 @@ async fn handle_client(action: Option<ClientAction>) -> Result<(), RcmError> {
         },
         ClientAction::Set { path } => {
             let path = resolve_path(path)?;
-            rcm_com::set_client(path.clone()).await?;
+            rcm_com::set_client(path.clone())?;
             log::info!("registered pipe user: {path}");
             Ok(())
         }
@@ -174,9 +174,9 @@ async fn handle_client(action: Option<ClientAction>) -> Result<(), RcmError> {
 /// The setting lives only in the running shell extension (it is not persisted),
 /// so both `Get` and `Set` require it to be loaded. `Set` affects the current
 /// Explorer session; an Explorer restart returns to the default (`on`).
-async fn handle_shift(action: Option<ShiftAction>) -> Result<(), RcmError> {
+fn handle_shift(action: Option<ShiftAction>) -> Result<(), RcmError> {
     match action.unwrap_or(ShiftAction::Get) {
-        ShiftAction::Get => match rcm_com::get_shift_bypass().await {
+        ShiftAction::Get => match rcm_com::get_shift_bypass() {
             Ok(enabled) => {
                 log::info!(
                     "Shift+right-click native menu: {} (shell extension)",
@@ -191,7 +191,7 @@ async fn handle_shift(action: Option<ShiftAction>) -> Result<(), RcmError> {
         },
         ShiftAction::Set { state } => {
             let enabled = bool::from(state);
-            rcm_com::set_shift_bypass(enabled).await?;
+            rcm_com::set_shift_bypass(enabled)?;
             log::info!(
                 "Shift+right-click native menu set to '{}' (this session only)",
                 on_off(enabled)
@@ -264,13 +264,13 @@ async fn main() {
         Commands::RestartExplorer => {
             restart_explorer(std::time::Duration::from_secs(5)).map_err(RcmError::from)
         }
-        Commands::Enable => rcm_com::enable().await.map(|_| {
+        Commands::Enable => rcm_com::enable().map(|_| {
             log::info!("Menu blocking ENABLED — native context menu will be hidden.");
         }),
-        Commands::Disable => rcm_com::disable().await.map(|_| {
+        Commands::Disable => rcm_com::disable().map(|_| {
             log::info!("Menu blocking DISABLED — native context menu will be shown.");
         }),
-        Commands::Query => match rcm_com::query().await {
+        Commands::Query => match rcm_com::query() {
             Ok(enabled) => {
                 log::info!(
                     "Menu blocking: {}",
@@ -280,9 +280,9 @@ async fn main() {
             }
             Err(e) => Err(e),
         },
-        Commands::Log { action } => handle_log(action).await,
-        Commands::Client { action } => handle_client(action).await,
-        Commands::Shift { action } => handle_shift(action).await,
+        Commands::Log { action } => handle_log(action),
+        Commands::Client { action } => handle_client(action),
+        Commands::Shift { action } => handle_shift(action),
     };
 
     // A non-zero exit code lets scripts and CI detect failure.

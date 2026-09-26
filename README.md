@@ -104,6 +104,25 @@ work to do. It does not install a `log` backend — call
 `rcm_com::logging::init_console()` or your own logger if you want the
 library's messages.
 
+### Sync vs async
+
+**Only the event stream is async** — watching events multiplexes a long-lived
+connection, so `listen` / `listen_with` return a `Future`.
+
+Every other call is a plain **blocking** function and needs no async runtime:
+
+```rust
+// A normal synchronous main() works fine.
+rcm_com::enable()?;
+let blocking = rcm_com::query()?;
+rcm_com::set_log_level(rcm_com::LogLevel::Debug)?;
+```
+
+`enable`, `disable`, `query`, `get_log_level`, `set_log_level`,
+`try_set_remote_log_level`, `get_client`, `set_client`, `get_shift_bypass` and
+`set_shift_bypass` are all synchronous. `is_enabled()` and `shift_bypass()` are
+synchronous too — they read this process's copy directly.
+
 ### Wire protocol
 
 Any language can implement the listener against `\\.\pipe\rcm_com`. Messages are

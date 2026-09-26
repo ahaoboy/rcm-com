@@ -4,6 +4,11 @@
 //! [`crate::pipe`], which hosts the single duplex named pipe shared with the
 //! `rcm` CLI — there is no longer a separate control pipe.
 //!
+//! The one-shot commands ([`enable`], [`disable`], [`query`], the log-level and
+//! Shift+right-click setters, …) are **synchronous**: they are "send, wait,
+//! done" requests and need no async runtime. Only the event stream
+//! ([`crate::server::listen`]) is async.
+//!
 //! The CBT hook and `QueryContextMenu` consult [`is_enabled`] before
 //! intercepting the native menu, and [`shift_bypass`] to decide whether
 //! Shift+right-click is allowed to show it anyway.
@@ -91,57 +96,57 @@ pub(crate) fn apply_shift_bypass(enabled: bool) {
 // =============================================================================
 
 /// Enable context-menu blocking (the default).
-pub async fn enable() -> Result<()> {
-    expect_ok(Request::Enable).await
+pub fn enable() -> Result<()> {
+    expect_ok(Request::Enable)
 }
 
 /// Disable context-menu blocking.
-pub async fn disable() -> Result<()> {
-    expect_ok(Request::Disable).await
+pub fn disable() -> Result<()> {
+    expect_ok(Request::Disable)
 }
 
 /// Query whether context-menu blocking is currently enabled.
 ///
 /// Reads the state back from the DLL, so callers always get the *real* state
 /// (unlike [`is_enabled`], which only reads this process's local copy).
-pub async fn query() -> Result<bool> {
-    match pipe::request(&Request::Query, CLIENT_TIMEOUT).await? {
+pub fn query() -> Result<bool> {
+    match pipe::request(&Request::Query, CLIENT_TIMEOUT)? {
         Response::State { enabled } => Ok(enabled),
         other => Err(unexpected(other)),
     }
 }
 
 /// Register `path` as the program currently using the pipe.
-pub async fn set_client(path: String) -> Result<()> {
-    expect_ok(Request::SetClient { path }).await
+pub fn set_client(path: String) -> Result<()> {
+    expect_ok(Request::SetClient { path })
 }
 
 /// Query the absolute path of the program registered as using the pipe.
 ///
 /// Returns `None` when nothing has been registered yet.
-pub async fn get_client() -> Result<Option<String>> {
-    match pipe::request(&Request::GetClient, CLIENT_TIMEOUT).await? {
+pub fn get_client() -> Result<Option<String>> {
+    match pipe::request(&Request::GetClient, CLIENT_TIMEOUT)? {
         Response::Client { path } => Ok(path),
         other => Err(unexpected(other)),
     }
 }
 
 /// Query the log level of the running DLL.
-pub async fn get_log_level() -> Result<LogLevel> {
-    match pipe::request(&Request::GetLog, CLIENT_TIMEOUT).await? {
+pub fn get_log_level() -> Result<LogLevel> {
+    match pipe::request(&Request::GetLog, CLIENT_TIMEOUT)? {
         Response::LogLevel { level } => Ok(level),
         other => Err(unexpected(other)),
     }
 }
 
 /// Set the Shift+right-click policy on a running DLL (not persisted).
-pub async fn set_shift_bypass(enabled: bool) -> Result<()> {
-    expect_ok(Request::SetShiftBypass { enabled }).await
+pub fn set_shift_bypass(enabled: bool) -> Result<()> {
+    expect_ok(Request::SetShiftBypass { enabled })
 }
 
 /// Query the Shift+right-click policy of the running DLL.
-pub async fn get_shift_bypass() -> Result<bool> {
-    match pipe::request(&Request::GetShiftBypass, CLIENT_TIMEOUT).await? {
+pub fn get_shift_bypass() -> Result<bool> {
+    match pipe::request(&Request::GetShiftBypass, CLIENT_TIMEOUT)? {
         Response::ShiftBypass { enabled } => Ok(enabled),
         other => Err(unexpected(other)),
     }
@@ -151,17 +156,17 @@ pub async fn get_shift_bypass() -> Result<bool> {
 ///
 /// Returns an error when the shell extension is not currently loaded; use
 /// [`try_set_remote_log_level`] for a best-effort variant.
-pub async fn set_log_level(level: LogLevel) -> Result<()> {
-    expect_ok(Request::SetLog { level }).await
+pub fn set_log_level(level: LogLevel) -> Result<()> {
+    expect_ok(Request::SetLog { level })
 }
 
 /// Best-effort request to change the log level of a running DLL.
 ///
 /// Returns `false` when the shell extension is not currently loaded, so the
 /// caller can report that the new level applies only after it reloads.
-pub async fn try_set_remote_log_level(level: LogLevel) -> bool {
+pub fn try_set_remote_log_level(level: LogLevel) -> bool {
     matches!(
-        pipe::request(&Request::SetLog { level }, NOTIFY_TIMEOUT).await,
+        pipe::request(&Request::SetLog { level }, NOTIFY_TIMEOUT),
         Ok(Response::Ok)
     )
 }
@@ -171,8 +176,8 @@ pub async fn try_set_remote_log_level(level: LogLevel) -> bool {
 // =============================================================================
 
 /// Send a request that answers with a plain acknowledgement.
-async fn expect_ok(request: Request) -> Result<()> {
-    match pipe::request(&request, CLIENT_TIMEOUT).await? {
+fn expect_ok(request: Request) -> Result<()> {
+    match pipe::request(&request, CLIENT_TIMEOUT)? {
         Response::Ok => Ok(()),
         Response::Error { message } => Err(RcmError::Environment(message)),
         other => Err(unexpected(other)),
