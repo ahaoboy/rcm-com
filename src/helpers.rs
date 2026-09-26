@@ -1,8 +1,10 @@
-//! DLL utility helpers — module handle, path resolution, timestamps, and
-//! named-pipe security descriptors.
+//! DLL utility helpers — module handle, path resolution, timestamps, timing,
+//! and named-pipe security descriptors.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use chrono::Utc;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, HMODULE, LocalFree};
@@ -22,6 +24,37 @@ pub(crate) static DLL_MODULE: AtomicUsize = AtomicUsize::new(0);
 
 /// Global COM object reference count for `DllCanUnloadNow`.
 pub(crate) static DLL_REF_COUNT: AtomicU32 = AtomicU32::new(0);
+
+// =============================================================================
+// Monotonic clock and event ids
+// =============================================================================
+
+/// Process-start reference for monotonic timings.
+///
+/// A single shared reference keeps timestamps from different modules (the CBT
+/// hook deadline and the context-menu stopwatch) directly comparable.
+static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Monotonic microseconds since process start.
+pub(crate) fn monotonic_micros() -> u64 {
+    START.elapsed().as_micros() as u64
+}
+
+/// Monotonic milliseconds since process start.
+pub(crate) fn monotonic_millis() -> u64 {
+    START.elapsed().as_millis() as u64
+}
+
+/// Sequence for [`next_event_id`].
+static EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Return a process-unique, monotonically increasing id for a captured event.
+///
+/// Useful for correlating a log line with the event a listener received.
+/// Formatted as lowercase hex so the payload stays short.
+pub(crate) fn next_event_id() -> String {
+    format!("{:x}", EVENT_SEQ.fetch_add(1, Ordering::Relaxed))
+}
 
 // =============================================================================
 // Module path resolution
@@ -84,9 +117,17 @@ pub(crate) fn dll_dir() -> Option<std::path::PathBuf> {
     dll_path()?.parent().map(|p| p.to_path_buf())
 }
 
-/// Return a UTC timestamp string for log entries and captured events.
+/// Return a UTC timestamp string for log entries.
 pub(crate) fn timestamp() -> String {
     Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string()
+}
+
+/// Current wall-clock time as microseconds since the Unix epoch (UTC).
+///
+/// Used for the absolute time on captured events, where a plain string would
+/// be awkward to compare or arithmetic on.
+pub(crate) fn unix_micros() -> u64 {
+    Utc::now().timestamp_micros().max(0) as u64
 }
 
 // =============================================================================

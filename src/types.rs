@@ -81,24 +81,85 @@ impl std::fmt::Display for Event {
 
 /// All captured right-click context data sent from the shell extension to the
 /// listening process via the named pipe.
+///
+/// Fields are grouped by meaning (identity/timing, location, owning window,
+/// trigger) rather than by size: Rust's default `repr` already reorders fields
+/// for the smallest layout, so this order costs nothing and reads better.
+///
+/// Every field carries `#[serde(default)]` so the wire format stays additive:
+/// a payload produced by a different version still deserialises instead of
+/// failing on a missing key. Always add new fields the same way.
+///
+/// **Units:** the timing fields ([`Self::captured`], [`Self::elapsed`]) are
+/// integers in **microseconds**. The unit is stated here once rather than
+/// repeated in each field name.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ContextMenuInfo {
+    // ── identity & timing ────────────────────────────────────────────────
+    /// Process-unique id of this event (monotonic, hex).
+    ///
+    /// Lets a listener correlate events with each other or with the
+    /// extension's log lines.
+    #[serde(default)]
     pub cid: String,
-    pub ts: String,
+    /// Wall-clock instant at which the capture started.
+    ///
+    /// **Microseconds since the Unix epoch (UTC).** This is an absolute
+    /// instant, not a duration: adding [`Self::elapsed`] yields the moment the
+    /// record was handed to the pipe.
+    ///
+    /// The value stays below 2^53 (~year 2255), so it survives a round trip
+    /// through JSON consumers that use IEEE-754 doubles.
+    #[serde(default)]
+    pub captured: u64,
+    /// Time spent inside the shell extension producing this record.
+    ///
+    /// **Microseconds**, measured from `IShellExtInit::Initialize` (entry)
+    /// until `IContextMenu::QueryContextMenu` hands the record to the pipe, so
+    /// it covers everything the extension costs the shell for one right-click.
+    #[serde(default)]
+    pub elapsed: u64,
+
+    // ── where the click happened ─────────────────────────────────────────
+    /// Cursor position in screen coordinates.
+    #[serde(default)]
     pub x: i32,
+    /// Cursor position in screen coordinates.
+    #[serde(default)]
     pub y: i32,
+    /// Folder the menu was invoked on; may be empty for some shell paths.
+    #[serde(default)]
     pub dir: String,
+    /// Selected items. Empty means the click was on the background.
+    #[serde(default)]
     pub files: Vec<String>,
+    /// `true` when the click was on empty space rather than on selected items.
+    #[serde(default)]
     pub bg: bool,
+
+    // ── owning window ────────────────────────────────────────────────────
+    /// Foreground window handle, as an integer.
+    #[serde(default)]
     pub hwnd: usize,
+    /// Window class of the foreground window, e.g. `CabinetWClass`.
+    #[serde(default)]
     pub class: String,
+    /// Process id of the process the extension is running in (Explorer).
+    #[serde(default)]
     pub pid: u32,
+
+    // ── trigger ──────────────────────────────────────────────────────────
+    /// What kind of right-click produced this event, with the raw flags.
+    #[serde(default)]
     pub event: Event,
 }
 
 impl std::fmt::Display for ContextMenuInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "[{}]", self.ts)?;
+        writeln!(f, "Event:  {}", self.event)?;
+        writeln!(f, "Id:     {}", self.cid)?;
+        writeln!(f, "Captured: {} us since Unix epoch", self.captured)?;
+        writeln!(f, "Elapsed: {:.3} ms", self.elapsed as f64 / 1000.0)?;
         writeln!(f, "Position: ({}, {})", self.x, self.y)?;
         writeln!(f, "Directory: {}", self.dir)?;
         writeln!(f, "Background: {}", self.bg)?;
@@ -106,7 +167,6 @@ impl std::fmt::Display for ContextMenuInfo {
         writeln!(f, "Window: 0x{:X}", self.hwnd)?;
         writeln!(f, "Window Class: {}", self.class)?;
         writeln!(f, "Process ID: {}", self.pid)?;
-        writeln!(f, "Event: {}", self.event)?;
         if !self.files.is_empty() {
             writeln!(f, "Selected Files:")?;
             for file in &self.files {

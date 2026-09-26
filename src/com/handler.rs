@@ -6,7 +6,7 @@
 //! at runtime with `rcm enable` / `rcm disable`.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use windows::Win32::Foundation::*;
 use windows::Win32::UI::Shell::*;
@@ -29,6 +29,9 @@ pub(crate) struct ContextMenuHandler {
     pub(crate) vtbl_init: *const IShellExtInitVtbl,
     pub(crate) vtbl_menu: *const IContextMenuVtbl,
     ref_count: AtomicU32,
+    /// Monotonic microseconds at `Initialize` entry, used to report how long
+    /// the extension spent producing the current record.
+    started_us: AtomicU64,
     pub(crate) info: std::sync::Mutex<ContextMenuInfo>,
 }
 
@@ -59,6 +62,7 @@ impl ContextMenuHandler {
             vtbl_init: &SHELL_EXT_INIT_VTBL,
             vtbl_menu: &CONTEXT_MENU_VTBL,
             ref_count: AtomicU32::new(1),
+            started_us: AtomicU64::new(0),
             info: std::sync::Mutex::new(ContextMenuInfo::default()),
         }
     }
@@ -173,6 +177,14 @@ unsafe extern "system" fn handler_initialize(
     _hkey_prog_id: isize,
 ) -> HRESULT {
     unsafe {
+        let handler = &*(this as *const ContextMenuHandler);
+
+        // Start the stopwatch as early as possible so the reported duration
+        // covers everything this invocation costs the shell.
+        handler
+            .started_us
+            .store(helpers::monotonic_micros(), Ordering::Relaxed);
+
         // Always install the CBT hook to block native context menu windows.
         // This works for both Win10 (TrackPopupMenu) and Win11 (new menu).
         install_cbt_menu_blocker();
@@ -180,13 +192,13 @@ unsafe extern "system" fn handler_initialize(
         // previous right-click must not leak into this one.
         reset_native_menu_override();
 
-        let handler = &*(this as *const ContextMenuHandler);
         let Ok(mut info) = handler.info.lock() else {
             return E_FAIL;
         };
         *info = ContextMenuInfo::default();
 
-        info.ts = helpers::timestamp();
+        info.cid = helpers::next_event_id();
+        info.captured = helpers::unix_micros();
         info.pid = std::process::id();
 
         // Cursor position
@@ -255,6 +267,13 @@ unsafe extern "system" fn handler_query_context_menu(
         // broadcast outside the lock: the pipe server only does non-blocking
         // sends, so the Explorer UI thread never waits on I/O.
         let event = if let Ok(mut info) = handler.info.lock() {
+            // Record how long the extension spent producing this record. The
+            // clock is monotonic, so a wall-clock adjustment cannot make this
+            // negative — but keep `saturating_sub` as cheap insurance.
+            // Reported in microseconds; see `ContextMenuInfo` for units.
+            info.elapsed = helpers::monotonic_micros()
+                .saturating_sub(handler.started_us.load(Ordering::Relaxed));
+
             // Determine event type from flags.
             if uflags & CMF_DEFAULTONLY != 0 {
                 info.event = Event::Click { flags: uflags };

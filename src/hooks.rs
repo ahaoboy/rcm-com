@@ -28,21 +28,18 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::helpers::DLL_MODULE;
+use crate::helpers::{self, DLL_MODULE};
 
 /// How long after a handler is initialized new popup menus are blocked.
 const MENU_BLOCK_TTL_MS: u64 = 3_000;
 /// How often the janitor checks whether the blocking window has elapsed.
 const JANITOR_POLL_MS: u64 = 200;
-
-/// Monotonic reference for deadline computation.
-static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 /// Absolute (process-relative) millisecond deadline until which new popup
 /// menus are blocked. `0` means "not blocking".
@@ -67,13 +64,9 @@ thread_local! {
     static ALLOW_NATIVE_MENU: Cell<bool> = const { Cell::new(false) };
 }
 
-fn monotonic_ms() -> u64 {
-    START.elapsed().as_millis() as u64
-}
-
 fn blocking_active() -> bool {
     let deadline = BLOCK_DEADLINE_MS.load(Ordering::Acquire);
-    deadline != 0 && monotonic_ms() <= deadline
+    deadline != 0 && helpers::monotonic_millis() <= deadline
 }
 
 /// Allow the native context menu for the current invocation on this thread.
@@ -130,7 +123,10 @@ unsafe extern "system" fn cbt_hook_proc(code: i32, _wparam: WPARAM, lparam: LPAR
 /// Install (or refresh) the WH_CBT hook for the current Explorer thread and
 /// extend the blocking window.
 pub(crate) fn install_cbt_menu_blocker() {
-    BLOCK_DEADLINE_MS.store(monotonic_ms().saturating_add(MENU_BLOCK_TTL_MS), Ordering::Release);
+    BLOCK_DEADLINE_MS.store(
+        helpers::monotonic_millis().saturating_add(MENU_BLOCK_TTL_MS),
+        Ordering::Release,
+    );
 
     let tid = unsafe { GetCurrentThreadId() };
     let mut hooks = HOOKS.lock().unwrap_or_else(|e| e.into_inner());

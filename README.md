@@ -84,7 +84,7 @@ use rcm_com::server::{listen, listen_with, ListenOptions};
 
 // Reports every right-click; reconnects automatically if Explorer restarts.
 listen(|info| {
-    println!("{} -> {:?}", info.ts, info.files);
+    println!("{} -> {:?}", info.captured, info.files);
 })
 .await?;
 
@@ -138,8 +138,15 @@ Any language can implement the listener against `\\.\pipe\rcm_com`. Messages are
 JSON object per captured right-click:
 
 ```json
-{"type":"event","event":{"cid":"","ts":"2026-05-26 10:30:15 UTC","x":1024,"y":768,"dir":"C:\\Users\\Admin\\Desktop","files":["C:\\Users\\Admin\\Desktop\\readme.txt"],"bg":false,"hwnd":1715004,"class":"CabinetWClass","pid":12345,"event":{"type":"Menu","flags":0}}}
+{"type":"event","event":{"cid":"3f","captured":1779781815000000,"elapsed":812,"x":1024,"y":768,"dir":"C:\\Users\\Admin\\Desktop","files":["C:\\Users\\Admin\\Desktop\\readme.txt"],"bg":false,"hwnd":1715004,"class":"CabinetWClass","pid":12345,"event":{"type":"Menu","flags":0}}}
 ```
+
+`cid` is a process-unique id for the event. The two timing fields are integers
+in **microseconds**: `captured` is the wall-clock instant the capture started
+(since the Unix epoch), and `elapsed` is how long the extension spent
+producing the record (from `Initialize` until it is handed to the pipe). Every
+field is optional on the wire, so payloads from a different version still
+parse.
 
 The connection stays open; multiple clients can subscribe at once and each
 receives every event. Events captured while nobody is connected are buffered
@@ -236,7 +243,10 @@ not need to be running, the extension just has to be loaded (right-click once).
 Right-click any file, folder, or empty space to see real-time output:
 
 ```
-INFO  [2026-05-26 10:30:15 UTC]
+INFO  Event:  Menu (0 - CMF_NORMAL)
+Id:     3f
+Captured: 1779781815000000 us since Unix epoch
+Elapsed: 0.812 ms
 Position: (1024, 768)
 Directory: C:\Users\Admin\Desktop
 Background: false
@@ -244,7 +254,6 @@ File Count: 2
 Window: 0x1A2B3C
 Window Class: CabinetWClass
 Process ID: 12345
-Event: Menu (0 - CMF_NORMAL)
 Selected Files:
   - C:\Users\Admin\Desktop\readme.txt
   - C:\Users\Admin\Desktop\photo.jpg
