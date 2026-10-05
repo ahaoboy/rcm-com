@@ -28,7 +28,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::windows::named_pipe::NamedPipeServer;
 
 use crate::consts::EVENT_PIPE_NAME;
-use crate::error::Result;
+use crate::error::{RcmError, Result};
 use crate::pipe::CONNECT_RETRY;
 use crate::types::ContextMenuInfo;
 
@@ -85,8 +85,19 @@ async fn serve_on<F>(name: &'static str, on_event: &mut F) -> Result<()>
 where
     F: FnMut(ContextMenuInfo),
 {
+    // Claim the name before accepting anything. A second listener cannot work:
+    // Windows hands each client connection to whichever instance is free, so two
+    // servers on one name each receive only part of the events. Failing here is
+    // far better than silently dropping every other right-click.
+    let first_instance = crate::pipe::create_server(name, true).map_err(|err| {
+        RcmError::Environment(format!(
+            "cannot host the event pipe '{name}': another listener already owns it ({err}). \
+             Only one listener may run at a time."
+        ))
+    })?;
+
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ContextMenuInfo>(EVENT_QUEUE_CAP);
-    tokio::spawn(accept_clients(name, tx));
+    tokio::spawn(accept_clients(name, first_instance, tx));
     while let Some(event) = rx.recv().await {
         on_event(event);
     }
@@ -94,27 +105,36 @@ where
 }
 
 /// Accept extension connections forever, one task per connection.
-async fn accept_clients(name: &'static str, tx: tokio::sync::mpsc::Sender<ContextMenuInfo>) {
-    let mut first = true;
+///
+/// `pending` is the already-claimed first instance; every later instance is
+/// created as an ordinary one because the name is ours from here on.
+async fn accept_clients(
+    name: &'static str,
+    mut pending: NamedPipeServer,
+    tx: tokio::sync::mpsc::Sender<ContextMenuInfo>,
+) {
     loop {
-        let is_first_instance = first;
-        first = false;
-
-        let server = match crate::pipe::create_server(name, is_first_instance) {
-            Ok(server) => server,
+        match pending.connect().await {
+            Ok(()) => {
+                // Detached: the task owns the instance and ends on disconnect.
+                tokio::spawn(read_events(pending, tx.clone()));
+            }
             Err(err) => {
-                log::warn!("failed to create the event pipe: {err}");
+                log::warn!("event pipe connect failed: {err}");
                 tokio::time::sleep(SERVER_RETRY).await;
-                continue;
+            }
+        }
+        // Replace the consumed instance. The name is already ours, so a failure
+        // here is transient and worth retrying.
+        pending = loop {
+            match crate::pipe::create_server(name, false) {
+                Ok(server) => break server,
+                Err(err) => {
+                    log::warn!("failed to create the event pipe: {err}");
+                    tokio::time::sleep(SERVER_RETRY).await;
+                }
             }
         };
-
-        if let Err(err) = server.connect().await {
-            log::warn!("event pipe connect failed: {err}");
-            tokio::time::sleep(SERVER_RETRY).await;
-            continue;
-        }
-        tokio::spawn(read_events(server, tx.clone()));
     }
 }
 

@@ -164,28 +164,47 @@ impl Drop for ActiveGuard {
 
 /// Accept control connections forever, one task per connection.
 async fn serve() {
-    let mut first = true;
-    loop {
-        // Only the first attempt may set `FIRST_PIPE_INSTANCE`; clearing it
-        // before the create is what lets a failed attempt recover on retry.
-        let is_first_instance = first;
-        first = false;
-
-        let server = match pipe::create_server(CONTROL_PIPE_NAME, is_first_instance) {
-            Ok(server) => server,
+    // Claim the name before serving, retrying with `FIRST_PIPE_INSTANCE` until
+    // this process owns it. Joining another process's instance would split the
+    // extension's state — menu blocking, Shift policy, log level are all
+    // per-process — so commands would reach only some Explorer processes.
+    // Retrying (rather than failing) is right because Explorer processes turn
+    // over, and this one must be able to take over when the previous owner exits.
+    let mut announced = false;
+    let mut pending = loop {
+        match pipe::create_server(CONTROL_PIPE_NAME, true) {
+            Ok(server) => break server,
             Err(err) => {
-                log::warn!("failed to create the control pipe: {err}");
+                if !announced {
+                    announced = true;
+                    log::info!("waiting to host the control pipe: {err}");
+                }
                 tokio::time::sleep(SERVER_RETRY).await;
-                continue;
+            }
+        }
+    };
+
+    loop {
+        match pending.connect().await {
+            Ok(()) => {
+                // Detached: the task owns the instance and ends after one reply.
+                tokio::spawn(handle_connection(pending));
+            }
+            Err(err) => {
+                log::warn!("control pipe connect failed: {err}");
+                tokio::time::sleep(SERVER_RETRY).await;
+            }
+        }
+        // The name is ours now, so later instances are ordinary ones.
+        pending = loop {
+            match pipe::create_server(CONTROL_PIPE_NAME, false) {
+                Ok(server) => break server,
+                Err(err) => {
+                    log::warn!("failed to create the control pipe: {err}");
+                    tokio::time::sleep(SERVER_RETRY).await;
+                }
             }
         };
-
-        if let Err(err) = server.connect().await {
-            log::warn!("control pipe connect failed: {err}");
-            tokio::time::sleep(SERVER_RETRY).await;
-            continue;
-        }
-        tokio::spawn(handle_connection(server));
     }
 }
 
