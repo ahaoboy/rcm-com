@@ -1,62 +1,37 @@
-//! Unified named-pipe transport.
+//! Wire protocol and the **control** channel's client side.
 //!
-//! Every interaction between the `rcm` CLI and the shell extension shares a
-//! **single duplex pipe** (`\\.\pipe\rcm_com`), with the DLL as the server and
-//! the CLI as the client:
+//! Two named pipes carry all traffic, with opposite ownership (see
+//! [`crate::consts`]):
 //!
-//! ```text
-//!   rcm start  ─┐
-//!   rcm enable ├─ client ──►  \\.\pipe\rcm_com  ──► DLL (server)
-//!   rcm query  ─┘                 (duplex)
-//! ```
+//! * **Control** (`\\.\pipe\rcm_com_control`) — the shell-extension DLL hosts
+//!   it and the `rcm` CLI connects, so `enable` / `query` / `log` work whenever
+//!   the extension is loaded. This module holds the request/response types and
+//!   the blocking client; the server lives in [`crate::control`].
+//! * **Events** (`\\.\pipe\rcm_com`) — the listener hosts it and the DLL
+//!   connects. See [`crate::events`].
 //!
-//! The DLL is the server because it owns all the shared state (menu blocking
-//! and log level). Hosting the pipe there lets *any* CLI process connect
-//! independently — `rcm enable` no longer needs `rcm start` to be running.
-//!
-//! Messages are newline-delimited JSON. [`Request`] travels client → server and
-//! [`Response`] server → client, so one reader/writer pair covers control
-//! commands, queries, log-level changes, and the event stream. JSON escapes
-//! control characters, so newline framing is unambiguous for path data.
-//!
-//! ## Never block the Explorer UI thread
-//!
-//! [`broadcast_event`] is called from `IContextMenu::QueryContextMenu` on an
-//! Explorer UI thread. It only does non-blocking `try_send`s into bounded
-//! per-subscriber queues; the actual pipe writes happen on the server runtime.
-//!
-//! Events are **live only**: if nobody is subscribed at the moment a
-//! right-click happens, that event is discarded. Nothing is buffered and
-//! replayed, so a subscriber never suddenly receives a burst of stale events
-//! when it reconnects — it sees exactly what happens while it is connected.
+//! Messages are newline-delimited JSON. JSON escapes control characters, so
+//! newline framing stays unambiguous for path data.
 
-use std::ffi::c_void;
-use std::os::windows::io::AsRawHandle;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{
-    AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf,
-};
-use tokio::net::windows::named_pipe::{
-    ClientOptions, NamedPipeClient, NamedPipeServer, PipeMode, ServerOptions,
-};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::net::windows::named_pipe::{NamedPipeServer, PipeMode, ServerOptions};
 
-use windows::Win32::Foundation::HANDLE;
-use windows::Win32::Storage::FileSystem::FlushFileBuffers;
-
-use crate::consts::PIPE_NAME;
+use crate::consts::CONTROL_PIPE_NAME;
 use crate::error::{RcmError, Result};
+use crate::helpers::PipeSecurity;
 use crate::logging::LogLevel;
-use crate::types::ContextMenuInfo;
+
+/// Delay between connection attempts by a client.
+pub(crate) const CONNECT_RETRY: Duration = Duration::from_millis(100);
 
 // =============================================================================
-// Wire protocol
+// Protocol
 // =============================================================================
 
-/// A request sent from a CLI client to the DLL server.
+/// A control request sent from the CLI to the shell extension.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub(crate) enum Request {
@@ -66,22 +41,13 @@ pub(crate) enum Request {
     Disable,
     /// Ask whether menu blocking is currently enabled.
     Query,
-    /// Stream context-menu events until the connection ends.
-    ///
-    /// The optional path is the client's own executable; the server records it
-    /// as the program currently using the pipe.
-    Subscribe {
-        path: Option<String>,
-        #[serde(default)]
-        options: SubscribeOptions,
-    },
     /// Change the log level of the running DLL.
     SetLog { level: LogLevel },
     /// Ask the running DLL for its current log level.
     GetLog,
-    /// Record the absolute path of the program using the pipe.
+    /// Record the absolute path of the program using the event pipe.
     SetClient { path: String },
-    /// Ask which program is recorded as using the pipe.
+    /// Ask which program is recorded as using the event pipe.
     GetClient,
     /// Set whether Shift+right-click shows the native menu.
     SetShiftBypass { enabled: bool },
@@ -89,25 +55,11 @@ pub(crate) enum Request {
     GetShiftBypass,
 }
 
-/// Optional initialisation parameters a subscriber can pass with
-/// [`Request::Subscribe`].
-///
-/// Every field is optional: an omitted field leaves the corresponding setting
-/// unchanged, so a client only sends what it cares about.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub(crate) struct SubscribeOptions {
-    /// Show the native menu on Shift+right-click. Applied to the DLL for this
-    /// session only (not persisted) — the last subscriber to pass a value wins,
-    /// since menu blocking is global.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shift_bypass: Option<bool>,
-}
-
-/// A message sent from the DLL server to a CLI client.
+/// A reply from the shell extension. Exactly one is sent per [`Request`].
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum Response {
-    /// The control command was applied.
+    /// The command was applied.
     Ok,
     /// Reply to [`Request::Query`].
     State { enabled: bool },
@@ -119,372 +71,44 @@ pub(crate) enum Response {
     ShiftBypass { enabled: bool },
     /// The request could not be applied.
     Error { message: String },
-    /// A captured context-menu event, delivered to subscribers.
-    Event { event: ContextMenuInfo },
 }
 
 // =============================================================================
-// Tuning
+// Framing
 // =============================================================================
 
-/// Delay between connection attempts.
-const CONNECT_RETRY: Duration = Duration::from_millis(100);
-/// Delay before recreating the server pipe after an error.
-const SERVER_RETRY: Duration = Duration::from_millis(200);
-/// Delay before the supervisor restarts a server that stopped.
-const SERVER_RESTART_DELAY: Duration = Duration::from_secs(1);
-/// Per-subscriber queue depth — events are dropped if a client falls behind.
-const EVENT_QUEUE_CAP: usize = 64;
-
-// =============================================================================
-// Server state
-// =============================================================================
-
-struct Subscriber {
-    id: u64,
-    tx: tokio::sync::mpsc::Sender<Arc<str>>,
-}
-
-/// Connected event subscribers, protected by a short-lived lock.
-static SUBSCRIBERS: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
-
-static NEXT_SUBSCRIBER_ID: AtomicU64 = AtomicU64::new(1);
-static SERVER_ACTIVE: AtomicBool = AtomicBool::new(false);
-static SERVER_STARTED: OnceLock<()> = OnceLock::new();
-
-/// Absolute path of the program currently registered as using the pipe.
+/// Maximum concurrent instances of one pipe.
 ///
-/// Set explicitly by `rcm client set`, and automatically by every subscriber
-/// (so `rcm start` registers itself).
-static CLIENT_PATH: Mutex<Option<String>> = Mutex::new(None);
+/// Must stay below 255: that value is reserved for `PIPE_UNLIMITED_INSTANCES`
+/// and `ServerOptions` rejects it.
+const MAX_INSTANCES: usize = 16;
 
-/// Whether the pipe server thread is currently running.
-pub(crate) fn server_active() -> bool {
-    SERVER_ACTIVE.load(Ordering::Acquire)
-}
-
-/// Marks the server as active for as long as it actually runs.
+/// Create one pipe-server instance, restricted to the current user and
+/// `Local System`.
 ///
-/// The flag used to be set before `block_on` and cleared after it, so any
-/// abnormal exit from the server thread (a panic, or an early `return`) left it
-/// stuck at `true`. That is worse than it sounds: `DllCanUnloadNow` then reports
-/// "cannot unload" forever, pinning the DLL — and its file lock — inside
-/// Explorer **while the pipe itself was already gone**. An RAII guard clears the
-/// flag on every exit path, unwinding included.
-struct ActiveGuard;
-
-impl ActiveGuard {
-    fn enter() -> Self {
-        SERVER_ACTIVE.store(true, Ordering::Release);
-        Self
-    }
-}
-
-impl Drop for ActiveGuard {
-    fn drop(&mut self) {
-        SERVER_ACTIVE.store(false, Ordering::Release);
-    }
-}
-
-fn set_client_path(path: String) {
-    *CLIENT_PATH.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
-}
-
-fn client_path() -> Option<String> {
-    CLIENT_PATH
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-}
-
-// =============================================================================
-// Server
-// =============================================================================
-
-/// Start the pipe server, once per process.
+/// Shared by both channels so the security and instance settings cannot drift
+/// apart. Synchronous on purpose: [`crate::helpers::PipeSecurity`] owns raw
+/// pointers and is not `Send`, so it must be dropped before the caller awaits.
 ///
-/// Safe to call from any normal thread — **never** from `DllMain`, which runs
-/// under the loader lock.
-pub fn start_server() {
-    SERVER_STARTED.get_or_init(|| {
-        if let Err(err) = std::thread::Builder::new()
-            .name("rcm-pipe-server".into())
-            .spawn(supervise_server)
-        {
-            log::error!("failed to start the pipe server thread: {err}");
-        }
-    });
+/// `first` guards the name against squatting. Only the very first attempt may
+/// set it — retries must not, or a failed attempt could never recover.
+pub(crate) fn create_server(name: &str, first: bool) -> std::io::Result<NamedPipeServer> {
+    let mut security = PipeSecurity::new();
+    let mut options = ServerOptions::new();
+    options.first_pipe_instance(first);
+    options.max_instances(MAX_INSTANCES);
+    options.pipe_mode(PipeMode::Byte);
+    // Safety: `security` owns a valid SECURITY_ATTRIBUTES (or a null descriptor
+    // on fallback) that outlives this call — the kernel copies the descriptor
+    // into the pipe object.
+    unsafe { options.create_with_security_attributes_raw(name, security.as_ptr()) }
 }
 
-/// Keep the pipe server alive for as long as the process lives.
-///
-/// The server owns the pipe *name*, so if it ever stops the pipe disappears and
-/// no client can reconnect until something happens to restart it. Previously
-/// nothing did: a single abnormal exit silently removed the pipe for the rest of
-/// the process's life. Restarting from one place makes the endpoint recover on
-/// its own instead of requiring an Explorer restart.
-fn supervise_server() {
-    loop {
-        run_server();
-        // `serve()` loops forever, so reaching here means the server stopped.
-        log::warn!(
-            "pipe server stopped; restarting in {} ms",
-            SERVER_RESTART_DELAY.as_millis()
-        );
-        std::thread::sleep(SERVER_RESTART_DELAY);
-    }
-}
-
-/// Build a runtime and serve until the server stops for any reason.
-fn run_server() {
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            log::error!("failed to build the pipe runtime: {err}");
-            return;
-        }
-    };
-    // Held for the whole server lifetime; cleared on the way out, including if
-    // `serve` unwinds.
-    let _active = ActiveGuard::enter();
-    runtime.block_on(serve());
-}
-
-/// Accept connections forever, one task per connection.
-async fn serve() {
-    let mut first = true;
-    loop {
-        // `FILE_FLAG_FIRST_PIPE_INSTANCE` guards the name against squatting, but
-        // only the very first attempt may set it: if that attempt fails because
-        // an instance already exists, every later attempt must *not* set it, or
-        // it can never succeed. Clearing the flag up front is what makes the
-        // retry below able to recover — previously the flag persisted after a
-        // failure, so the server retried `FIRST_PIPE_INSTANCE` forever and the
-        // pipe was never created.
-        let is_first_instance = first;
-        first = false;
-
-        // Restrict the pipe to the current user and Local System so other local
-        // processes cannot read captured paths or change the blocking state.
-        let mut security = crate::helpers::PipeSecurity::new();
-        let mut options = ServerOptions::new();
-        options.first_pipe_instance(is_first_instance);
-        // Must stay below 255: that value is reserved for
-        // PIPE_UNLIMITED_INSTANCES and `ServerOptions` rejects it.
-        options.max_instances(16);
-        options.pipe_mode(PipeMode::Byte);
-
-        // Safety: `security` owns a valid SECURITY_ATTRIBUTES (or a null
-        // descriptor on fallback) that outlives this call.
-        let created = unsafe {
-            options.create_with_security_attributes_raw(PIPE_NAME, security.as_ptr())
-        };
-        let server = match created {
-            Ok(server) => server,
-            Err(err) => {
-                log::warn!("failed to create the pipe: {err}");
-                tokio::time::sleep(SERVER_RETRY).await;
-                continue;
-            }
-        };
-
-        if let Err(err) = server.connect().await {
-            log::warn!("pipe connect failed: {err}");
-            tokio::time::sleep(SERVER_RETRY).await;
-            continue;
-        }
-        tokio::spawn(handle_connection(server));
-    }
-}
-
-/// Read the first request and dispatch it.
-async fn handle_connection(server: NamedPipeServer) {
-    // Capture the raw handle before splitting so one-shot replies can be
-    // flushed to the client before the pipe closes. It is stored as an integer
-    // because `HANDLE` is not `Send` and this handler is spawned on the runtime.
-    let handle = server.as_raw_handle() as isize;
-    let (read_half, write_half) = tokio::io::split(server);
-    let mut reader = BufReader::new(read_half);
-    let mut writer = write_half;
-
-    let mut line = String::new();
-    match reader.read_line(&mut line).await {
-        Ok(0) | Err(_) => return,
-        Ok(_) => {}
-    }
-    let request = match serde_json::from_str::<Request>(line.trim_end()) {
-        Ok(request) => request,
-        Err(err) => {
-            log::warn!("ignored malformed pipe request: {err}");
-            return;
-        }
-    };
-
-    match request {
-        Request::Subscribe { path, options } => handle_subscription(reader, writer, path, options).await,
-        Request::Enable => {
-            crate::control::set_enabled(true);
-            reply(&mut writer, &Response::Ok, handle).await;
-        }
-        Request::Disable => {
-            crate::control::set_enabled(false);
-            reply(&mut writer, &Response::Ok, handle).await;
-        }
-        Request::Query => {
-            let enabled = crate::control::is_enabled();
-            reply(&mut writer, &Response::State { enabled }, handle).await;
-        }
-        Request::SetLog { level } => {
-            crate::logging::apply_level(level);
-            reply(&mut writer, &Response::Ok, handle).await;
-        }
-        Request::GetLog => {
-            let level = crate::logging::current_level();
-            reply(&mut writer, &Response::LogLevel { level }, handle).await;
-        }
-        Request::SetClient { path } => {
-            set_client_path(path);
-            reply(&mut writer, &Response::Ok, handle).await;
-        }
-        Request::GetClient => {
-            let path = client_path();
-            reply(&mut writer, &Response::Client { path }, handle).await;
-        }
-        Request::SetShiftBypass { enabled } => {
-            crate::control::apply_shift_bypass(enabled);
-            reply(&mut writer, &Response::Ok, handle).await;
-        }
-        Request::GetShiftBypass => {
-            let enabled = crate::control::shift_bypass();
-            reply(&mut writer, &Response::ShiftBypass { enabled }, handle).await;
-        }
-    }
-}
-
-/// Write a single response and flush it to the client.
-async fn reply(writer: &mut WriteHalf<NamedPipeServer>, response: &Response, handle: isize) {
-    if write_message(writer, response).await.is_err() {
-        return;
-    }
-    // Closing the pipe can discard buffered data; FlushFileBuffers blocks until
-    // the client has read everything, which is what makes one-shot replies
-    // (notably `rcm query`) reliable.
-    unsafe {
-        let _ = FlushFileBuffers(HANDLE(handle as *mut c_void));
-    }
-}
-
-/// Forward broadcast events to one subscriber until it disconnects.
-async fn handle_subscription(
-    mut reader: BufReader<ReadHalf<NamedPipeServer>>,
-    mut writer: WriteHalf<NamedPipeServer>,
-    client: Option<String>,
-    options: SubscribeOptions,
-) {
-    // A subscriber announces its own executable, which is what
-    // `rcm client get` reports as the program using the pipe.
-    if let Some(path) = client {
-        set_client_path(path);
-    }
-    // Subscription options are applied to the DLL for this session only.
-    // Menu blocking is global, so the last subscriber to pass a value wins.
-    if let Some(enabled) = options.shift_bypass {
-        crate::control::apply_shift_bypass(enabled);
-        log::info!(
-            "subscriber set shift+right-click native menu to '{}'",
-            if enabled { "on" } else { "off" }
-        );
-    }
-
-    let id = NEXT_SUBSCRIBER_ID.fetch_add(1, Ordering::Relaxed);
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Arc<str>>(EVENT_QUEUE_CAP);
-    SUBSCRIBERS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(Subscriber { id, tx });
-
-    let mut scratch = String::new();
-    loop {
-        tokio::select! {
-            message = rx.recv() => match message {
-                Some(line) => {
-                    if writer.write_all(line.as_bytes()).await.is_err() {
-                        break;
-                    }
-                    let _ = writer.flush().await;
-                }
-                None => break,
-            },
-            // The subscriber sends nothing after subscribing; a read returning
-            // 0 bytes is how we notice it disconnected.
-            read = reader.read_line(&mut scratch) => match read {
-                Ok(0) | Err(_) => break,
-                Ok(_) => scratch.clear(),
-            },
-        }
-    }
-    unregister(id);
-}
-
-fn unregister(id: u64) {
-    SUBSCRIBERS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|subscriber| subscriber.id != id);
-}
-
-/// Fan a captured context-menu event out to every subscriber.
-///
-/// Called from the Explorer UI thread, so it never blocks. The event is live
-/// only: with no subscribers it is dropped rather than buffered, so a later
-/// subscriber is not handed stale events on connect.
-pub(crate) fn broadcast_event(event: ContextMenuInfo) {
-    let line: Arc<str> = match serde_json::to_string(&Response::Event { event }) {
-        Ok(json) => Arc::from(format!("{json}\n")),
-        Err(err) => {
-            log::warn!("failed to serialise context-menu event: {err}");
-            return;
-        }
-    };
-
-    let mut subscribers = SUBSCRIBERS.lock().unwrap_or_else(|e| e.into_inner());
-    subscribers.retain(|subscriber| {
-        !matches!(
-            subscriber.tx.try_send(line.clone()),
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
-        )
-    });
-}
-
-// =============================================================================
-// Client
-// =============================================================================
-
-/// Connect to the shell extension's pipe for the event stream.
-///
-/// Retries forever, which is what `rcm start` wants while it waits for the
-/// shell extension to be loaded.
-async fn connect() -> NamedPipeClient {
-    let mut announced = false;
-    loop {
-        match ClientOptions::new().open(PIPE_NAME) {
-            Ok(client) => return client,
-            Err(_) => {
-                if !announced {
-                    announced = true;
-                    log::info!("waiting for the shell extension on pipe '{PIPE_NAME}'...");
-                }
-                tokio::time::sleep(CONNECT_RETRY).await;
-            }
-        }
-    }
-}
-
-/// Write a newline-terminated JSON message.
-async fn write_message<W>(writer: &mut W, message: &(impl Serialize + ?Sized)) -> Result<()>
+/// Write one newline-terminated JSON message.
+pub(crate) async fn write_message<W>(
+    writer: &mut W,
+    message: &(impl Serialize + ?Sized),
+) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
@@ -495,25 +119,32 @@ where
     Ok(())
 }
 
-/// Send a request and read the single response, blocking the calling thread.
+// =============================================================================
+// Control client (blocking)
+// =============================================================================
+
+/// Send a control request and read its single reply, blocking the caller.
 ///
-/// One-shot control commands are inherently "send, wait, done", so this uses
-/// plain blocking I/O and needs no async runtime — callers can use it from
-/// ordinary synchronous code. Only the event stream ([`subscribe`]) stays
-/// async, because it multiplexes a long-lived connection.
+/// Control commands are "send, wait, done", so plain blocking I/O keeps the
+/// public API synchronous and usable without an async runtime. Only the event
+/// stream is async, because it is long-lived.
+///
+/// The *connection* is retried until `timeout` (the extension may still be
+/// starting); the *read* is not, which is fine for a cooperative server that
+/// always answers.
 pub(crate) fn request(request: &Request, timeout: Duration) -> Result<Response> {
     let deadline = Instant::now() + timeout;
     let mut pipe = loop {
         match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(PIPE_NAME)
+            .open(CONTROL_PIPE_NAME)
         {
             Ok(pipe) => break pipe,
             Err(err) => {
                 if Instant::now() >= deadline {
                     return Err(RcmError::Environment(format!(
-                        "the shell extension is not running (pipe '{PIPE_NAME}'): {err}"
+                        "the shell extension is not running (pipe '{CONTROL_PIPE_NAME}'): {err}"
                     )));
                 }
                 std::thread::sleep(CONNECT_RETRY);
@@ -533,52 +164,4 @@ pub(crate) fn request(request: &Request, timeout: Duration) -> Result<Response> 
         ));
     }
     Ok(serde_json::from_str(line.trim_end())?)
-}
-
-/// Subscribe to the context-menu event stream, reconnecting if the shell
-/// extension (or Explorer) restarts. Runs until the process exits.
-///
-/// `options` are sent with every (re)subscription; see [`SubscribeOptions`].
-pub(crate) async fn subscribe<F>(
-    mut on_event: F,
-    options: Option<bool>,
-) -> Result<()>
-where
-    F: FnMut(ContextMenuInfo),
-{
-    loop {
-        let mut client = connect().await;
-        if write_message(
-            &mut client,
-            &Request::Subscribe {
-                path: std::env::current_exe()
-                    .ok()
-                    .map(|path| path.to_string_lossy().into_owned()),
-                options: SubscribeOptions {
-                    shift_bypass: options,
-                },
-            },
-        )
-        .await
-        .is_err()
-        {
-            continue;
-        }
-        log::info!("connected to the shell extension — waiting for context menu events");
-
-        let mut reader = BufReader::new(client);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => match serde_json::from_str::<Response>(line.trim_end()) {
-                    Ok(Response::Event { event }) => on_event(event),
-                    Ok(other) => log::debug!("ignored unexpected pipe message: {other:?}"),
-                    Err(err) => log::warn!("ignored malformed pipe message: {err}"),
-                },
-            }
-        }
-        log::warn!("lost the shell extension connection; reconnecting...");
-    }
 }

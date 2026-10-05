@@ -125,20 +125,18 @@ synchronous too — they read this process's copy directly.
 
 ### Wire protocol
 
-Any language can implement the listener against `\\.\pipe\rcm_com`. Messages are
-**newline-delimited JSON**, one message per line. Send one request to subscribe:
+Two pipes are used, with **opposite ownership**:
+
+| Pipe | Hosted by (server) | Client | Carries |
+|---|---|---|---|
+| `\\.\pipe\rcm_com` | the listener | each shell-extension instance | events |
+| `\\.\pipe\rcm_com_control` | the shell extension | the `rcm` CLI | `enable` / `query` / `log` / … |
+
+Events flow one way: the extension connects and writes one JSON object per
+right-click; the listener never sends anything back.
 
 ```json
-{"cmd":"subscribe","path":"C:\\tools\\my-listener.exe","options":{"shift_bypass":false}}
-```
-
-`path` is optional; when given it is recorded as the pipe's registered user
-(see `rcm client get`). `options` is optional too — see
-[Shift + right-click](#shift--right-click). After that the server pushes one
-JSON object per captured right-click:
-
-```json
-{"type":"event","event":{"cid":"3f","captured":1779781815000000,"elapsed":812,"x":1024,"y":768,"dir":"C:\\Users\\Admin\\Desktop","files":["C:\\Users\\Admin\\Desktop\\readme.txt"],"bg":false,"hwnd":1715004,"class":"CabinetWClass","pid":12345,"event":{"type":"Menu","flags":0}}}
+{"cid":"3f","captured":1779781815000000,"elapsed":812,"x":1024,"y":768,"dir":"C:\\Users\\Admin\\Desktop","files":["C:\\Users\\Admin\\Desktop\\readme.txt"],"bg":false,"hwnd":1715004,"class":"CabinetWClass","pid":12345,"event":{"type":"Menu","flags":0}}
 ```
 
 `cid` is a process-unique id for the event. The two timing fields are integers
@@ -148,16 +146,28 @@ producing the record (from `Initialize` until it is handed to the pipe). Every
 field is optional on the wire, so payloads from a different version still
 parse.
 
-The connection stays open; multiple clients can subscribe at once and each
-receives every event.
+Because the listener hosts the pipe:
 
-Events are **live only**: an event that happens while nobody is subscribed is
-discarded, and reconnecting does not re-deliver earlier events. A subscriber
-therefore sees exactly the right-clicks that occur while it is connected.
+* restarting Explorer does **not** break the channel — the extension reconnects
+  when it is loaded again;
+* Windows runs several `explorer.exe` processes, and each connects separately,
+  so events from **all** of them arrive at the one listener.
 
-The other request types (`enable`, `disable`, `query`, `get_log`, `set_log`,
-`get_client`, `set_client`, `get_shift_bypass`, `set_shift_bypass`) each answer
-with a single `{"type":...}` line; see `src/pipe.rs` for the full list.
+Events are **live only**: an event is dropped rather than delivered late. Two
+rules enforce that:
+
+* the extension connects, sends one event, and disconnects per event;
+* an event older than a short TTL (500 ms) is discarded, and if no listener
+  accepts it the queued backlog is cleared too.
+
+So a listener sees exactly the right-clicks that happen while it is running.
+Starting `rcm start` after clicking several times does **not** replay those
+earlier clicks.
+
+Control requests travel the other way. Any request type (`enable`, `disable`,
+`query`, `get_log`, `set_log`, `get_client`, `set_client`, `get_shift_bypass`,
+`set_shift_bypass`) answers with a single `{"type":...}` line; see `src/pipe.rs`
+for the full list.
 
 ### Shift + right-click
 

@@ -39,7 +39,8 @@ pub(crate) struct IShellExtInitVtbl {
 #[repr(C)]
 pub(crate) struct IContextMenuVtbl {
     pub(crate) base: IUnknownVtbl,
-    pub(crate) QueryContextMenu: unsafe extern "system" fn(*mut c_void, isize, u32, u32, u32, u32) -> HRESULT,
+    pub(crate) QueryContextMenu:
+        unsafe extern "system" fn(*mut c_void, isize, u32, u32, u32, u32) -> HRESULT,
     pub(crate) InvokeCommand: unsafe extern "system" fn(*mut c_void, *const c_void) -> HRESULT,
     pub(crate) GetCommandString:
         unsafe extern "system" fn(*mut c_void, usize, u32, *const u32, *mut u8, u32) -> HRESULT,

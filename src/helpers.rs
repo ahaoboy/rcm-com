@@ -5,8 +5,8 @@ use std::ffi::c_void;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use chrono::Utc;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, HMODULE, LocalFree};
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -118,16 +118,35 @@ pub(crate) fn dll_dir() -> Option<std::path::PathBuf> {
 }
 
 /// Return a UTC timestamp string for log entries.
+///
+/// Formatting is done by hand from the field accessors rather than through
+/// `time`'s `formatting` feature, which would pull in a proc-macro crate just
+/// for one fixed pattern.
 pub(crate) fn timestamp() -> String {
-    Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string()
+    let now = time::OffsetDateTime::now_utc();
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second(),
+    )
 }
 
 /// Current wall-clock time as microseconds since the Unix epoch (UTC).
 ///
-/// Used for the absolute time on captured events, where a plain string would
-/// be awkward to compare or arithmetic on.
+/// Used for the absolute time on captured events, where a plain string would be
+/// awkward to compare or do arithmetic on. `std` already handles the epoch
+/// conversion, so there is no reason to do it by hand.
 pub(crate) fn unix_micros() -> u64 {
-    Utc::now().timestamp_micros().max(0) as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        // Only possible if the clock is set before 1970, where 0 is as good an
+        // answer as any and avoids a panic in library code.
+        .unwrap_or_default()
+        .as_micros() as u64
 }
 
 // =============================================================================
@@ -153,9 +172,7 @@ impl PipeSecurity {
         Self {
             attrs: SECURITY_ATTRIBUTES {
                 nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-                lpSecurityDescriptor: descriptor
-                    .map(|d| d.0)
-                    .unwrap_or(std::ptr::null_mut()),
+                lpSecurityDescriptor: descriptor.map(|d| d.0).unwrap_or(std::ptr::null_mut()),
                 bInheritHandle: BOOL(0),
             },
             descriptor,

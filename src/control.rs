@@ -1,98 +1,271 @@
-//! Menu-blocking state and the public control API.
+//! Menu-blocking state, the CLI-side control API, and the control-pipe server
+//! that runs inside the shell extension.
 //!
-//! The state itself is a process-global atomic; all transport goes through
-//! [`crate::pipe`], which hosts the single duplex named pipe shared with the
-//! `rcm` CLI — there is no longer a separate control pipe.
-//!
-//! The one-shot commands ([`enable`], [`disable`], [`query`], the log-level and
-//! Shift+right-click setters, …) are **synchronous**: they are "send, wait,
-//! done" requests and need no async runtime. Only the event stream
-//! ([`crate::server::listen`]) is async.
-//!
-//! The CBT hook and `QueryContextMenu` consult [`is_enabled`] before
-//! intercepting the native menu, and [`shift_bypass`] to decide whether
-//! Shift+right-click is allowed to show it anyway.
+//! The state is process-global to the extension. Transport is the control pipe
+//! (see [`crate::pipe`]); the extension hosts it so one-shot commands work
+//! whenever the extension is loaded, without a listener process running.
 //!
 //! Public API: [`enable`], [`disable`], [`query`], [`is_enabled`], [`start`],
 //! [`shift_bypass`], [`set_shift_bypass`], [`get_shift_bypass`],
 //! [`get_log_level`], [`set_log_level`], [`try_set_remote_log_level`],
 //! [`get_client`], and [`set_client`].
 
+use std::ffi::c_void;
+use std::os::windows::io::AsRawHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use tokio::io::{AsyncBufReadExt, BufReader, WriteHalf};
+use tokio::net::windows::named_pipe::NamedPipeServer;
+
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Storage::FileSystem::FlushFileBuffers;
+
+use crate::consts::CONTROL_PIPE_NAME;
 use crate::error::{RcmError, Result};
 use crate::logging::LogLevel;
 use crate::pipe::{self, Request, Response};
 
+/// Timeout for one-shot control commands.
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Short timeout for best-effort pushes such as the log level.
+const NOTIFY_TIMEOUT: Duration = Duration::from_millis(200);
+/// Delay before recreating the control pipe after an error.
+const SERVER_RETRY: Duration = Duration::from_millis(200);
+/// Delay before the supervisor restarts a stopped control server.
+const SERVER_RESTART_DELAY: Duration = Duration::from_secs(1);
+
 // =============================================================================
-// Global state
+// State
 // =============================================================================
 
-/// `true` = block the native context menu (default).
-/// `false` = let the system menu appear normally.
+/// `true` = block the native context menu (the default).
 static MENU_BLOCKING_ENABLED: AtomicBool = AtomicBool::new(true);
 
-/// `true` = let Shift+right-click show the native menu (default).
+/// `true` = let Shift+right-click show the native menu (the default).
 ///
-/// On Windows 11 the classic context menu is reached with Shift+right-click,
-/// so the default keeps that escape hatch working while a plain right-click is
-/// still intercepted. Set to `false` to intercept Shift as well.
-///
-/// This is deliberately **not persisted**: it lives only in the running DLL, so
-/// an Explorer restart returns to the default.
+/// On Windows 11 the classic menu is reached with Shift+right-click, so the
+/// default preserves that escape hatch while a plain right-click stays
+/// intercepted. Not persisted: an Explorer restart returns to the default.
 static SHIFT_BYPASS: AtomicBool = AtomicBool::new(true);
 
-/// Timeout for one-shot control commands (`enable` / `disable` / `query`).
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(3);
-/// Short timeout for best-effort notifications such as pushing a log level.
-const NOTIFY_TIMEOUT: Duration = Duration::from_millis(200);
+/// Absolute path of the program registered as using the event pipe.
+static CLIENT_PATH: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
-// =============================================================================
-// DLL-internal state
-// =============================================================================
+/// Whether the control-pipe server thread is running.
+static SERVER_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SERVER_STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
-/// Ensure the pipe server is running.
-///
-/// Called from `cf_create_instance` (a normal COM activation thread), never
-/// from `DllMain`, which runs under the loader lock. Idempotent.
-///
-/// Unlike the DLL's own entry point, this does **not** install the `log`
-/// backend — embedding programs decide their own logging. Call
-/// [`crate::logging::init_dll`] (or any `log` logger) first if you want the
-/// extension's log messages to appear.
-pub fn start() {
-    pipe::start_server();
-}
-
-/// Check whether menu blocking is currently enabled.
-///
-/// Called from the CBT hook and `QueryContextMenu` on every right-click.
+/// Whether menu blocking is currently enabled.
 pub fn is_enabled() -> bool {
     MENU_BLOCKING_ENABLED.load(Ordering::Relaxed)
 }
 
-/// Update the blocking state (called by the pipe server for `enable`/`disable`).
+/// Update the blocking state (called by the control server).
 pub(crate) fn set_enabled(enabled: bool) {
     MENU_BLOCKING_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
-/// Whether Shift+right-click shows the native menu instead of being
-/// intercepted (default `true`).
+/// Whether Shift+right-click shows the native menu instead of being intercepted.
 pub fn shift_bypass() -> bool {
     SHIFT_BYPASS.load(Ordering::Relaxed)
 }
 
-/// Update the Shift+right-click policy for this process only.
-///
-/// Used by the pipe server when a subscriber passes it as a subscription
-/// option, and when `rcm shift set` reaches a running DLL.
+/// Update the Shift+right-click policy for this process.
 pub(crate) fn apply_shift_bypass(enabled: bool) {
     SHIFT_BYPASS.store(enabled, Ordering::Relaxed);
 }
 
+/// Whether the control-pipe server thread is running.
+pub(crate) fn server_active() -> bool {
+    SERVER_ACTIVE.load(Ordering::Acquire)
+}
+
+fn set_client_path(path: String) {
+    *CLIENT_PATH.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+}
+
+fn client_path() -> Option<String> {
+    CLIENT_PATH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 // =============================================================================
-// Public API
+// Server (inside the shell extension)
+// =============================================================================
+
+/// Start the control-pipe server, once per process.
+///
+/// Called from the COM entry points, which run on ordinary threads — **never**
+/// from `DllMain`, where spawning threads or touching the registry can deadlock
+/// Explorer. Idempotent.
+pub fn start() {
+    SERVER_STARTED.get_or_init(|| {
+        if let Err(err) = std::thread::Builder::new()
+            .name("rcm-control-server".into())
+            .spawn(supervise)
+        {
+            log::error!("failed to start the control server thread: {err}");
+        }
+    });
+}
+
+/// Keep the control server alive for as long as the process lives.
+///
+/// The server owns the pipe name, so a silent exit would make every later
+/// command fail until Explorer restarts. Restarting from one place keeps the
+/// endpoint available.
+fn supervise() {
+    loop {
+        run_server();
+        log::warn!(
+            "control server stopped; restarting in {} ms",
+            SERVER_RESTART_DELAY.as_millis()
+        );
+        std::thread::sleep(SERVER_RESTART_DELAY);
+    }
+}
+
+/// Build a runtime and serve until the server stops for any reason.
+fn run_server() {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            log::error!("failed to build the control runtime: {err}");
+            return;
+        }
+    };
+    // RAII so the flag is cleared on every exit path, panics included. A flag
+    // stuck at `true` would make `DllCanUnloadNow` refuse forever, pinning the
+    // DLL — and its file lock — inside Explorer even with no pipe left.
+    let _active = ActiveGuard::enter();
+    runtime.block_on(serve());
+}
+
+struct ActiveGuard;
+
+impl ActiveGuard {
+    fn enter() -> Self {
+        SERVER_ACTIVE.store(true, Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        SERVER_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+/// Accept control connections forever, one task per connection.
+async fn serve() {
+    let mut first = true;
+    loop {
+        // Only the first attempt may set `FIRST_PIPE_INSTANCE`; clearing it
+        // before the create is what lets a failed attempt recover on retry.
+        let is_first_instance = first;
+        first = false;
+
+        let server = match pipe::create_server(CONTROL_PIPE_NAME, is_first_instance) {
+            Ok(server) => server,
+            Err(err) => {
+                log::warn!("failed to create the control pipe: {err}");
+                tokio::time::sleep(SERVER_RETRY).await;
+                continue;
+            }
+        };
+
+        if let Err(err) = server.connect().await {
+            log::warn!("control pipe connect failed: {err}");
+            tokio::time::sleep(SERVER_RETRY).await;
+            continue;
+        }
+        tokio::spawn(handle_connection(server));
+    }
+}
+
+/// Read one request, apply it, and reply.
+async fn handle_connection(server: NamedPipeServer) {
+    // Grab the raw handle before splitting so the reply can be flushed to the
+    // client before the pipe closes. Stored as an integer because `HANDLE` is
+    // not `Send` and this runs on the runtime.
+    let handle = server.as_raw_handle() as isize;
+    let (read_half, write_half) = tokio::io::split(server);
+    let mut reader = BufReader::new(read_half);
+    let mut writer = write_half;
+
+    let mut line = String::new();
+    match reader.read_line(&mut line).await {
+        Ok(0) | Err(_) => return,
+        Ok(_) => {}
+    }
+    let response = match serde_json::from_str::<Request>(line.trim_end()) {
+        Ok(request) => apply(request),
+        Err(err) => {
+            log::warn!("ignored malformed control request: {err}");
+            return;
+        }
+    };
+    reply(&mut writer, &response, handle).await;
+}
+
+/// Apply a request to the extension's state and produce the reply.
+fn apply(request: Request) -> Response {
+    match request {
+        Request::Enable => {
+            set_enabled(true);
+            Response::Ok
+        }
+        Request::Disable => {
+            set_enabled(false);
+            Response::Ok
+        }
+        Request::Query => Response::State {
+            enabled: is_enabled(),
+        },
+        Request::SetLog { level } => {
+            crate::logging::apply_level(level);
+            Response::Ok
+        }
+        Request::GetLog => Response::LogLevel {
+            level: crate::logging::current_level(),
+        },
+        Request::SetClient { path } => {
+            set_client_path(path);
+            Response::Ok
+        }
+        Request::GetClient => Response::Client {
+            path: client_path(),
+        },
+        Request::SetShiftBypass { enabled } => {
+            apply_shift_bypass(enabled);
+            Response::Ok
+        }
+        Request::GetShiftBypass => Response::ShiftBypass {
+            enabled: shift_bypass(),
+        },
+    }
+}
+
+/// Write a reply and flush it to the client.
+async fn reply(writer: &mut WriteHalf<NamedPipeServer>, response: &Response, handle: isize) {
+    if pipe::write_message(writer, response).await.is_err() {
+        return;
+    }
+    // Closing the pipe discards buffered data; FlushFileBuffers blocks until the
+    // client has read it, which is what makes one-shot replies reliable.
+    unsafe {
+        let _ = FlushFileBuffers(HANDLE(handle as *mut c_void));
+    }
+}
+
+// =============================================================================
+// Client API (used by the CLI and by embedding programs)
 // =============================================================================
 
 /// Enable context-menu blocking (the default).
@@ -107,8 +280,8 @@ pub fn disable() -> Result<()> {
 
 /// Query whether context-menu blocking is currently enabled.
 ///
-/// Reads the state back from the DLL, so callers always get the *real* state
-/// (unlike [`is_enabled`], which only reads this process's local copy).
+/// Reads from the extension, so it reports the *real* state rather than this
+/// process's own copy (which [`is_enabled`] returns).
 pub fn query() -> Result<bool> {
     match pipe::request(&Request::Query, CLIENT_TIMEOUT)? {
         Response::State { enabled } => Ok(enabled),
@@ -116,14 +289,12 @@ pub fn query() -> Result<bool> {
     }
 }
 
-/// Register `path` as the program currently using the pipe.
+/// Register `path` as the program using the event pipe.
 pub fn set_client(path: String) -> Result<()> {
     expect_ok(Request::SetClient { path })
 }
 
-/// Query the absolute path of the program registered as using the pipe.
-///
-/// Returns `None` when nothing has been registered yet.
+/// Query the program registered as using the event pipe.
 pub fn get_client() -> Result<Option<String>> {
     match pipe::request(&Request::GetClient, CLIENT_TIMEOUT)? {
         Response::Client { path } => Ok(path),
@@ -131,7 +302,7 @@ pub fn get_client() -> Result<Option<String>> {
     }
 }
 
-/// Query the log level of the running DLL.
+/// Query the log level of the running extension.
 pub fn get_log_level() -> Result<LogLevel> {
     match pipe::request(&Request::GetLog, CLIENT_TIMEOUT)? {
         Response::LogLevel { level } => Ok(level),
@@ -139,31 +310,12 @@ pub fn get_log_level() -> Result<LogLevel> {
     }
 }
 
-/// Set the Shift+right-click policy on a running DLL (not persisted).
-pub fn set_shift_bypass(enabled: bool) -> Result<()> {
-    expect_ok(Request::SetShiftBypass { enabled })
-}
-
-/// Query the Shift+right-click policy of the running DLL.
-pub fn get_shift_bypass() -> Result<bool> {
-    match pipe::request(&Request::GetShiftBypass, CLIENT_TIMEOUT)? {
-        Response::ShiftBypass { enabled } => Ok(enabled),
-        other => Err(unexpected(other)),
-    }
-}
-
-/// Change the log level of a running DLL.
-///
-/// Returns an error when the shell extension is not currently loaded; use
-/// [`try_set_remote_log_level`] for a best-effort variant.
+/// Change the log level of the running extension.
 pub fn set_log_level(level: LogLevel) -> Result<()> {
     expect_ok(Request::SetLog { level })
 }
 
-/// Best-effort request to change the log level of a running DLL.
-///
-/// Returns `false` when the shell extension is not currently loaded, so the
-/// caller can report that the new level applies only after it reloads.
+/// Best-effort log-level push. `false` when the extension is not loaded.
 pub fn try_set_remote_log_level(level: LogLevel) -> bool {
     matches!(
         pipe::request(&Request::SetLog { level }, NOTIFY_TIMEOUT),
@@ -171,11 +323,28 @@ pub fn try_set_remote_log_level(level: LogLevel) -> bool {
     )
 }
 
-// =============================================================================
-// Helpers
-// =============================================================================
+/// Set the Shift+right-click policy on the running extension.
+pub fn set_shift_bypass(enabled: bool) -> Result<()> {
+    expect_ok(Request::SetShiftBypass { enabled })
+}
 
-/// Send a request that answers with a plain acknowledgement.
+/// Query the Shift+right-click policy of the running extension.
+pub fn get_shift_bypass() -> Result<bool> {
+    match pipe::request(&Request::GetShiftBypass, CLIENT_TIMEOUT)? {
+        Response::ShiftBypass { enabled } => Ok(enabled),
+        other => Err(unexpected(other)),
+    }
+}
+
+/// Best-effort Shift+right-click push, used by [`crate::server::listen_with`].
+pub(crate) fn try_set_shift_bypass(enabled: bool) -> Result<()> {
+    match pipe::request(&Request::SetShiftBypass { enabled }, NOTIFY_TIMEOUT)? {
+        Response::Ok => Ok(()),
+        Response::Error { message } => Err(RcmError::Environment(message)),
+        other => Err(unexpected(other)),
+    }
+}
+
 fn expect_ok(request: Request) -> Result<()> {
     match pipe::request(&request, CLIENT_TIMEOUT)? {
         Response::Ok => Ok(()),

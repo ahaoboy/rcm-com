@@ -138,7 +138,8 @@ pub(crate) fn open_key(parent: HKEY, subkey: &str) -> Result<HKEY> {
 }
 
 pub(crate) fn get_reg_value(key: HKEY, name: Option<&str>) -> Result<String> {
-    let name_wide: Option<Vec<u16>> = name.map(to_wide);    let name_pcwstr = name_wide
+    let name_wide: Option<Vec<u16>> = name.map(to_wide);
+    let name_pcwstr = name_wide
         .as_ref()
         .map(|v| PCWSTR(v.as_ptr()))
         .unwrap_or(PCWSTR::null());
@@ -294,7 +295,8 @@ pub struct HandlerStatus {
 }
 
 pub struct Status {
-    pub pipe_name: String,
+    pub event_pipe: String,
+    pub control_pipe: String,
     pub dll_path: Option<PathBuf>,
     pub clsid_exists: bool,
     pub clsid_name: Option<String>,
@@ -318,7 +320,12 @@ impl Display for Status {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "RCM Context Menu Status")?;
         writeln!(f, "=======================")?;
-        writeln!(f, "Pipe Name:      {}", self.pipe_name)?;
+        writeln!(f, "Event pipe:     {}  (listener hosts)", self.event_pipe)?;
+        writeln!(
+            f,
+            "Control pipe:   {}  (extension hosts)",
+            self.control_pipe
+        )?;
         if let Some(dll) = &self.dll_path {
             writeln!(f, "Expected DLL:   {}", dll.display())?;
         } else {
@@ -387,7 +394,8 @@ pub fn status() -> Result<Status> {
     let dll = dll_path().ok();
 
     let mut status = Status {
-        pipe_name: crate::PIPE_NAME.to_string(),
+        event_pipe: crate::EVENT_PIPE_NAME.to_string(),
+        control_pipe: crate::CONTROL_PIPE_NAME.to_string(),
         dll_path: dll,
         clsid_exists: false,
         clsid_name: None,

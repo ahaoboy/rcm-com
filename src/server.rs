@@ -1,33 +1,28 @@
-//! Context-menu event listener for the `rcm start` command.
+//! Public entry point for listening to context-menu events.
 //!
-//! The transport (single duplex pipe, framing, reconnection) lives in
-//! [`crate::pipe`]; this module is the small public entry point the CLI uses.
+//! The transport lives in [`crate::events`]; this module is the stable API an
+//! embedding program uses.
 
 use crate::error::Result;
 use crate::types::ContextMenuInfo;
 
-/// Optional parameters a listener can send when it subscribes.
-///
-/// Every field is optional: leave it as `None` to keep the current setting.
+/// Optional parameters sent to the shell extension when a listener starts.
 #[derive(Debug, Default, Clone)]
 pub struct ListenOptions {
     /// Whether Shift+right-click should show the native menu.
     ///
-    /// `Some(true)` (the default policy) keeps the Windows 11 escape hatch
-    /// working; `Some(false)` intercepts Shift as well. Applied to the running
-    /// extension for this session only — menu blocking is global, so the last
-    /// subscriber to pass a value wins.
+    /// `Some(true)` (the extension's default) keeps the Windows 11 classic-menu
+    /// escape hatch working; `Some(false)` intercepts Shift as well. Applied to
+    /// the running extension for this session only — menu blocking is global, so
+    /// the last listener to set it wins.
     pub shift_bypass: Option<bool>,
 }
 
 /// Stream context-menu events until the process exits.
 ///
-/// Connects to the shell extension and calls `on_message` for every captured
-/// event, reconnecting automatically if Explorer (and therefore the pipe
-/// server) restarts. While the shell extension has not been loaded yet, this
-/// waits and retries.
-///
-/// This is the entry point for embedding a listener in your own program:
+/// Hosts the event pipe, so the listener owns it: restarting Explorer does not
+/// break the channel, and every Explorer process that loads the extension
+/// connects independently, so events from all of them arrive here.
 ///
 /// ```no_run
 /// # async fn run() -> Result<(), rcm_com::error::RcmError> {
@@ -39,10 +34,8 @@ pub struct ListenOptions {
 /// # }
 /// ```
 ///
-/// The function never returns, so spawn it as a background task when your
-/// program has other work to do. Use [`listen_with`] to pass subscription
-/// options. For non-Rust implementations the wire protocol is documented in
-/// the README.
+/// Never returns; spawn it as a background task if your program has other work
+/// to do. Use [`listen_with`] to pass [`ListenOptions`].
 pub async fn listen<F>(on_message: F) -> Result<()>
 where
     F: FnMut(ContextMenuInfo),
@@ -50,7 +43,7 @@ where
     listen_with(on_message, ListenOptions::default()).await
 }
 
-/// Like [`listen`], but sends initialisation parameters when subscribing.
+/// Like [`listen`], but applies [`ListenOptions`] to the extension first.
 ///
 /// ```no_run
 /// # async fn run() -> Result<(), rcm_com::error::RcmError> {
@@ -71,5 +64,22 @@ pub async fn listen_with<F>(on_message: F, options: ListenOptions) -> Result<()>
 where
     F: FnMut(ContextMenuInfo),
 {
-    crate::pipe::subscribe(on_message, options.shift_bypass).await
+    // Best effort: the extension may not be loaded yet. Applied once here rather
+    // than per event, because menu policy is global state, not something the
+    // event stream carries.
+    //
+    // `try_set_shift_bypass` is blocking pipe I/O, so it is pushed onto a
+    // blocking thread — calling it directly would stall an executor worker for
+    // up to its timeout.
+    if let Some(enabled) = options.shift_bypass {
+        let pushed =
+            tokio::task::spawn_blocking(move || crate::control::try_set_shift_bypass(enabled))
+                .await;
+        match pushed {
+            Ok(Err(err)) => log::debug!("could not apply shift_bypass yet: {err}"),
+            Err(err) => log::debug!("shift_bypass task failed: {err}"),
+            Ok(Ok(())) => {}
+        }
+    }
+    crate::events::serve(on_message).await
 }

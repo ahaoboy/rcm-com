@@ -1,5 +1,9 @@
 use thiserror::Error;
 
+/// Errors surfaced by the crate.
+///
+/// Only variants that are actually constructed live here; an unused one is dead
+/// weight in the public API.
 #[derive(Error, Debug)]
 pub enum RcmError {
     #[error("I/O Error: {0}")]
@@ -7,9 +11,6 @@ pub enum RcmError {
 
     #[error("Serialization Error: {0}")]
     Serialization(#[from] serde_json::Error),
-
-    #[error("UTF-8 Decoding Error: {0}")]
-    Utf8(#[from] std::string::FromUtf8Error),
 
     #[error("Registry Error: {0}")]
     Registry(String),
@@ -19,9 +20,6 @@ pub enum RcmError {
 
     #[error("Environment Error: {0}")]
     Environment(String),
-
-    #[error("Windows Error: {0}")]
-    Windows(#[from] windows::core::Error),
 
     #[cfg(feature = "cli")]
     #[error("rcm-reg Error: {0}")]

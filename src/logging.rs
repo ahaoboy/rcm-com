@@ -184,16 +184,6 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
-    /// Every level, from quietest to most verbose.
-    pub const ALL: [LogLevel; 6] = [
-        LogLevel::Off,
-        LogLevel::Error,
-        LogLevel::Warn,
-        LogLevel::Info,
-        LogLevel::Debug,
-        LogLevel::Trace,
-    ];
-
     /// Convert to the [`log`] crate's filter.
     pub const fn to_filter(self) -> LevelFilter {
         match self {
@@ -203,18 +193,6 @@ impl LogLevel {
             LogLevel::Info => LevelFilter::Info,
             LogLevel::Debug => LevelFilter::Debug,
             LogLevel::Trace => LevelFilter::Trace,
-        }
-    }
-
-    /// Convert from the [`log`] crate's filter.
-    pub const fn from_filter(filter: LevelFilter) -> Self {
-        match filter {
-            LevelFilter::Off => LogLevel::Off,
-            LevelFilter::Error => LogLevel::Error,
-            LevelFilter::Warn => LogLevel::Warn,
-            LevelFilter::Info => LogLevel::Info,
-            LevelFilter::Debug => LogLevel::Debug,
-            LevelFilter::Trace => LogLevel::Trace,
         }
     }
 
@@ -334,11 +312,7 @@ impl RcmLogger {
         };
         {
             let mut dedupe = self.dedupe.lock().unwrap_or_else(|e| e.into_inner());
-            if dedupe.hash == hash
-                && dedupe
-                    .at
-                    .is_some_and(|t| t.elapsed() < LOG_DEDUP_WINDOW)
-            {
+            if dedupe.hash == hash && dedupe.at.is_some_and(|t| t.elapsed() < LOG_DEDUP_WINDOW) {
                 return;
             }
             dedupe.hash = hash;
@@ -419,10 +393,7 @@ fn init(target: Target) {
         ACTIVE_LEVEL.store(level.to_u8(), Ordering::Relaxed);
         let logger: &'static RcmLogger = Box::leak(Box::new(RcmLogger {
             target,
-            dedupe: Mutex::new(Dedupe {
-                hash: 0,
-                at: None,
-            }),
+            dedupe: Mutex::new(Dedupe { hash: 0, at: None }),
         }));
         let _ = LOGGER.set(logger);
         if log::set_logger(logger).is_ok() {

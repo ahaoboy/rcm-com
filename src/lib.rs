@@ -10,6 +10,7 @@ pub mod server;
 // ── private modules ──────────────────────────────────────────────────────
 pub(crate) mod com;
 pub(crate) mod control;
+pub(crate) mod events;
 pub(crate) mod helpers;
 pub(crate) mod hooks;
 pub(crate) mod pipe;
@@ -17,14 +18,14 @@ pub(crate) mod types;
 
 // ── public re-exports ────────────────────────────────────────────────────
 pub use cmd::{HandlerStatus, Status, register, status, unregister};
-pub use consts::PIPE_NAME;
+pub use consts::{CONTROL_PIPE_NAME, EVENT_PIPE_NAME};
 pub use control::{
     disable, enable, get_client, get_log_level, get_shift_bypass, is_enabled, query, set_client,
     set_log_level, set_shift_bypass, shift_bypass, start, try_set_remote_log_level,
 };
 pub use error::{RcmError, Result};
 pub use logging::LogLevel;
-pub use server::{listen, listen_with, ListenOptions};
+pub use server::{ListenOptions, listen, listen_with};
 pub use types::{ContextMenuInfo, Event};
 
 use std::ffi::c_void;
@@ -220,7 +221,8 @@ unsafe extern "system" fn DllGetClassObject(
 extern "system" fn DllCanUnloadNow() -> HRESULT {
     if helpers::DLL_REF_COUNT.load(Ordering::Relaxed) == 0
         && !hooks::has_active_cbt_hooks()
-        && !pipe::server_active()
+        && !control::server_active()
+        && !events::sender_active()
     {
         S_OK
     } else {

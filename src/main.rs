@@ -236,14 +236,16 @@ async fn main() {
     let result = match cli.command {
         Commands::Install => cmd::register(),
         Commands::Uninstall => cmd::unregister(),
-        Commands::Start => listen(|info| {
-            // The event stream is the purpose of `start`, so it is result
-            // output and unaffected by the log level. The full struct stays a
-            // `debug` diagnostic.
-            logging::output(&info);
-            log::debug!("{info:#?}");
-        })
-        .await,
+        Commands::Start => {
+            listen(|info| {
+                // The event stream is the purpose of `start`, so it is result
+                // output and unaffected by the log level. The full struct stays a
+                // `debug` diagnostic.
+                logging::output(&info);
+                log::debug!("{info:#?}");
+            })
+            .await
+        }
         Commands::Status => cmd::status().map(|s| {
             logging::output(&s);
         }),

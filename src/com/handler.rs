@@ -308,7 +308,7 @@ unsafe extern "system" fn handler_query_context_menu(
         };
 
         if let Some(event) = event {
-            crate::pipe::broadcast_event(event);
+            crate::events::send(event);
         }
 
         // We contribute no menu items; the native menu is suppressed by the

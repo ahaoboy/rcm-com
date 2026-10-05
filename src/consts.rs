@@ -22,10 +22,14 @@ pub const CONFIG_REG_KEY: &str = r"Software\RcmCom";
 /// Config value name for the persisted log level (see [`crate::logging`]).
 pub const CONFIG_LOG_LEVEL: &str = "LogLevel";
 
-/// Named pipe path used for **all** communication between the shell extension
-/// DLL (the server) and the `rcm` CLI (the client).
+/// Event pipe: the **listener** hosts it and each loaded shell-extension
+/// instance connects as a client.
 ///
-/// A single duplex pipe carries control commands (`enable` / `disable` /
-/// `query` / log level) and the live context-menu event stream; see
-/// [`crate::pipe`] for the wire protocol.
-pub const PIPE_NAME: &str = r"\\.\pipe\rcm_com";
+/// The listener owns the name, so restarting Explorer does not destroy this
+/// channel — and because every Explorer process connects separately, events
+/// from all of them reach the one listener. See [`crate::events`].
+pub const EVENT_PIPE_NAME: &str = r"\\.\pipe\rcm_com";
+
+/// Control pipe: the shell extension hosts it and the `rcm` CLI connects as a
+/// client. Short-lived request/response traffic only; see [`crate::pipe`].
+pub const CONTROL_PIPE_NAME: &str = r"\\.\pipe\rcm_com_control";
