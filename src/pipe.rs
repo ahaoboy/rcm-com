@@ -127,6 +127,8 @@ pub(crate) enum Response {
 const CONNECT_RETRY: Duration = Duration::from_millis(100);
 /// Delay before recreating the server pipe after an error.
 const SERVER_RETRY: Duration = Duration::from_millis(200);
+/// Delay before the supervisor restarts a server that stopped.
+const SERVER_RESTART_DELAY: Duration = Duration::from_secs(1);
 /// Per-subscriber queue depth — events are dropped if a client falls behind.
 const EVENT_QUEUE_CAP: usize = 64;
 /// Events retained for a subscriber that connects slightly late.
@@ -163,6 +165,29 @@ pub(crate) fn server_active() -> bool {
     SERVER_ACTIVE.load(Ordering::Acquire)
 }
 
+/// Marks the server as active for as long as it actually runs.
+///
+/// The flag used to be set before `block_on` and cleared after it, so any
+/// abnormal exit from the server thread (a panic, or an early `return`) left it
+/// stuck at `true`. That is worse than it sounds: `DllCanUnloadNow` then reports
+/// "cannot unload" forever, pinning the DLL — and its file lock — inside
+/// Explorer **while the pipe itself was already gone**. An RAII guard clears the
+/// flag on every exit path, unwinding included.
+struct ActiveGuard;
+
+impl ActiveGuard {
+    fn enter() -> Self {
+        SERVER_ACTIVE.store(true, Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        SERVER_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
 fn set_client_path(path: String) {
     *CLIENT_PATH.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
 }
@@ -186,13 +211,33 @@ pub fn start_server() {
     SERVER_STARTED.get_or_init(|| {
         if let Err(err) = std::thread::Builder::new()
             .name("rcm-pipe-server".into())
-            .spawn(run_server)
+            .spawn(supervise_server)
         {
             log::error!("failed to start the pipe server thread: {err}");
         }
     });
 }
 
+/// Keep the pipe server alive for as long as the process lives.
+///
+/// The server owns the pipe *name*, so if it ever stops the pipe disappears and
+/// no client can reconnect until something happens to restart it. Previously
+/// nothing did: a single abnormal exit silently removed the pipe for the rest of
+/// the process's life. Restarting from one place makes the endpoint recover on
+/// its own instead of requiring an Explorer restart.
+fn supervise_server() {
+    loop {
+        run_server();
+        // `serve()` loops forever, so reaching here means the server stopped.
+        log::warn!(
+            "pipe server stopped; restarting in {} ms",
+            SERVER_RESTART_DELAY.as_millis()
+        );
+        std::thread::sleep(SERVER_RESTART_DELAY);
+    }
+}
+
+/// Build a runtime and serve until the server stops for any reason.
 fn run_server() {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -204,22 +249,31 @@ fn run_server() {
             return;
         }
     };
-    SERVER_ACTIVE.store(true, Ordering::Release);
+    // Held for the whole server lifetime; cleared on the way out, including if
+    // `serve` unwinds.
+    let _active = ActiveGuard::enter();
     runtime.block_on(serve());
-    SERVER_ACTIVE.store(false, Ordering::Release);
 }
 
 /// Accept connections forever, one task per connection.
 async fn serve() {
     let mut first = true;
     loop {
+        // `FILE_FLAG_FIRST_PIPE_INSTANCE` guards the name against squatting, but
+        // only the very first attempt may set it: if that attempt fails because
+        // an instance already exists, every later attempt must *not* set it, or
+        // it can never succeed. Clearing the flag up front is what makes the
+        // retry below able to recover — previously the flag persisted after a
+        // failure, so the server retried `FIRST_PIPE_INSTANCE` forever and the
+        // pipe was never created.
+        let is_first_instance = first;
+        first = false;
+
         // Restrict the pipe to the current user and Local System so other local
         // processes cannot read captured paths or change the blocking state.
         let mut security = crate::helpers::PipeSecurity::new();
         let mut options = ServerOptions::new();
-        // `first_pipe_instance` prevents name squatting, but must be set only
-        // for the very first instance — later ones legitimately coexist.
-        options.first_pipe_instance(first);
+        options.first_pipe_instance(is_first_instance);
         // Must stay below 255: that value is reserved for
         // PIPE_UNLIMITED_INSTANCES and `ServerOptions` rejects it.
         options.max_instances(16);
@@ -238,7 +292,6 @@ async fn serve() {
                 continue;
             }
         };
-        first = false;
 
         if let Err(err) = server.connect().await {
             log::warn!("pipe connect failed: {err}");

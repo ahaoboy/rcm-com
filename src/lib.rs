@@ -190,6 +190,13 @@ unsafe extern "system" fn DllGetClassObject(
             return CLASS_E_CLASSNOTAVAILABLE;
         }
 
+        // Bring up logging and the pipe server as early as the shell touches
+        // this DLL. `DllGetClassObject` runs on a normal COM thread (not under
+        // the loader lock), and starting here means the pipe exists from the
+        // first activation rather than only once a handler is created.
+        crate::logging::init_dll();
+        crate::control::start();
+
         let factory = Box::new(ClassFactory {
             vtbl: &CLASS_FACTORY_VTBL,
             ref_count: AtomicU32::new(1),
