@@ -24,8 +24,12 @@
 //! [`broadcast_event`] is called from `IContextMenu::QueryContextMenu` on an
 //! Explorer UI thread. It only does non-blocking `try_send`s into bounded
 //! per-subscriber queues; the actual pipe writes happen on the server runtime.
+//!
+//! Events are **live only**: if nobody is subscribed at the moment a
+//! right-click happens, that event is discarded. Nothing is buffered and
+//! replayed, so a subscriber never suddenly receives a burst of stale events
+//! when it reconnects — it sees exactly what happens while it is connected.
 
-use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::os::windows::io::AsRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -131,8 +135,6 @@ const SERVER_RETRY: Duration = Duration::from_millis(200);
 const SERVER_RESTART_DELAY: Duration = Duration::from_secs(1);
 /// Per-subscriber queue depth — events are dropped if a client falls behind.
 const EVENT_QUEUE_CAP: usize = 64;
-/// Events retained for a subscriber that connects slightly late.
-const PENDING_CAP: usize = 8;
 
 // =============================================================================
 // Server state
@@ -145,10 +147,6 @@ struct Subscriber {
 
 /// Connected event subscribers, protected by a short-lived lock.
 static SUBSCRIBERS: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
-
-/// Events captured while nobody was subscribed, replayed to the next
-/// subscriber so the right-click that loaded the DLL is not lost.
-static PENDING: Mutex<VecDeque<Arc<str>>> = Mutex::new(VecDeque::new());
 
 static NEXT_SUBSCRIBER_ID: AtomicU64 = AtomicU64::new(1);
 static SERVER_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -408,20 +406,6 @@ async fn handle_subscription(
         .unwrap_or_else(|e| e.into_inner())
         .push(Subscriber { id, tx });
 
-    // Replay anything captured before this subscriber arrived.
-    let pending: Vec<Arc<str>> = PENDING
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .drain(..)
-        .collect();
-    for line in pending {
-        if writer.write_all(line.as_bytes()).await.is_err() {
-            unregister(id);
-            return;
-        }
-    }
-    let _ = writer.flush().await;
-
     let mut scratch = String::new();
     loop {
         tokio::select! {
@@ -454,8 +438,9 @@ fn unregister(id: u64) {
 
 /// Fan a captured context-menu event out to every subscriber.
 ///
-/// Called from the Explorer UI thread: it never blocks. With no subscribers the
-/// event is retained (bounded by [`PENDING_CAP`]) for the next subscriber.
+/// Called from the Explorer UI thread, so it never blocks. The event is live
+/// only: with no subscribers it is dropped rather than buffered, so a later
+/// subscriber is not handed stale events on connect.
 pub(crate) fn broadcast_event(event: ContextMenuInfo) {
     let line: Arc<str> = match serde_json::to_string(&Response::Event { event }) {
         Ok(json) => Arc::from(format!("{json}\n")),
@@ -466,15 +451,6 @@ pub(crate) fn broadcast_event(event: ContextMenuInfo) {
     };
 
     let mut subscribers = SUBSCRIBERS.lock().unwrap_or_else(|e| e.into_inner());
-    if subscribers.is_empty() {
-        drop(subscribers);
-        let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-        if pending.len() >= PENDING_CAP {
-            pending.pop_front();
-        }
-        pending.push_back(line);
-        return;
-    }
     subscribers.retain(|subscriber| {
         !matches!(
             subscriber.tx.try_send(line.clone()),

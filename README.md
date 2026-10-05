@@ -149,9 +149,11 @@ field is optional on the wire, so payloads from a different version still
 parse.
 
 The connection stays open; multiple clients can subscribe at once and each
-receives every event. Events captured while nobody is connected are buffered
-(the most recent few) and replayed to the next subscriber, so the right-click
-that loaded the extension is not lost.
+receives every event.
+
+Events are **live only**: an event that happens while nobody is subscribed is
+discarded, and reconnecting does not re-deliver earlier events. A subscriber
+therefore sees exactly the right-clicks that occur while it is connected.
 
 The other request types (`enable`, `disable`, `query`, `get_log`, `set_log`,
 `get_client`, `set_client`, `get_shift_bypass`, `set_shift_bypass`) each answer
